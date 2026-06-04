@@ -151,6 +151,9 @@
   `wp.init()` instead of a warning that allowed execution to continue. A missing or unreadable
   version symbol in a loaded native library is treated the same way
   ([GH-1508](https://github.com/NVIDIA/warp/issues/1508)).
+- Improve `wp.mesh_query_ray()` and `wp.mesh_query_ray_anym()` BVH traversal performance by
+  visiting the nearer child first at each inner node, enabling earlier tightening of the
+  closest-hit bound and more aggressive subtree pruning.
 
 ### Fixed
 
@@ -234,6 +237,10 @@
 - Fix `Tape.record_scope_end()` to raise a clear error for unmatched
   scope ends and preserve nested non-empty tape visualization scopes
   ([GH-1515](https://github.com/NVIDIA/warp/issues/1515)).
+- Fix `wp.mesh_query_ray()` and related functions silently missing intersections for
+  axis-aligned rays. A zero direction component caused `0 × ∞ = NaN` in the slab AABB
+  test, which propagated through comparisons and wrongly rejected valid BVH nodes. The
+  per-traversal AABB epsilon inflation workaround (`eps = 1e-3`) is also removed.
 
 ### Documentation
 
