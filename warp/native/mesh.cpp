@@ -129,7 +129,7 @@ uint64_t wp_mesh_create_host(
 {
     Mesh* m
         = new (wp_alloc_host(sizeof(Mesh), "(native:mesh)")) Mesh(points, velocities, indices, num_points, num_tris);
-    const bool use_cubql = (constructor_type == CUBQL_CONSTRUCTOR_TYPE);
+    const bool use_cubql = (constructor_type == BVH_CONSTRUCTOR_CUBQL);
 
     m->lowers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));
     m->uppers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));

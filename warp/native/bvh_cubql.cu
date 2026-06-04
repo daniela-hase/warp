@@ -565,7 +565,7 @@ void cubql_bvh_create_device(
     bvh_device_on_host.item_uppers = uppers;
     bvh_device_on_host.num_items = num_items;
     bvh_device_on_host.leaf_size = leaf_size;
-    bvh_device_on_host.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
+    bvh_device_on_host.constructor_type = BVH_CONSTRUCTOR_CUBQL;
 
     if (num_items <= 0) {
         return;
@@ -578,7 +578,7 @@ void cubql_bvh_create_device(
 
     auto free_partial_bvh = [&]() { wp::bvh_destroy_device(bvh_device_on_host); };
 
-    cuBQL::bvh3f native;
+    cuBQL::bvh3f native {};
     try {
         cuBQL::BuildConfig build_config;
         build_config.enableSAH();
@@ -643,7 +643,7 @@ void cubql_bvh_create_device(
 {
     wp::set_error_string("Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)");
     memset(&bvh_device_on_host, 0, sizeof(BVH));
-    bvh_device_on_host.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
+    bvh_device_on_host.constructor_type = BVH_CONSTRUCTOR_CUBQL;
 }
 
 void cubql_bvh_destroy_device(BVH&) { }
@@ -653,61 +653,3 @@ void cubql_bvh_rebuild_device(BVH&) { }
 #endif  // WP_DISABLE_CUBQL
 
 }  // namespace wp
-
-
-uint64_t wp_cubql_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size)
-{
-    ContextGuard guard(context);
-    wp::BVH bvh_device_on_host;
-    memset(&bvh_device_on_host, 0, sizeof(wp::BVH));
-
-    wp::cubql_bvh_create_device(WP_CURRENT_CONTEXT, lowers, uppers, num_items, leaf_size, bvh_device_on_host);
-#ifdef WP_DISABLE_CUBQL
-    return 0;
-#endif
-
-    if (!bvh_device_on_host.node_lowers && num_items > 0) {
-        return 0;
-    }
-
-    wp::BVH* bvh_device_ptr = (wp::BVH*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(wp::BVH));
-    wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh_device_ptr, &bvh_device_on_host, sizeof(wp::BVH));
-
-    uint64_t bvh_id = (uint64_t)bvh_device_ptr;
-    wp::bvh_add_descriptor(bvh_id, bvh_device_on_host);
-    return bvh_id;
-}
-
-void wp_cubql_bvh_refit_device(uint64_t id)
-{
-    wp::BVH bvh;
-    if (wp::bvh_get_descriptor(id, bvh)) {
-        ContextGuard guard(bvh.context);
-        if (!wp::cubql_bvh_refit_device(bvh)) {
-            return;
-        }
-        wp::bvh_add_descriptor(id, bvh);
-        wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::BVH));
-    }
-}
-
-void wp_cubql_bvh_rebuild_device(uint64_t id)
-{
-    wp::BVH bvh;
-    if (wp::bvh_get_descriptor(id, bvh)) {
-        ContextGuard guard(bvh.context);
-        wp::cubql_bvh_rebuild_device(bvh);
-        wp::bvh_add_descriptor(id, bvh);
-        wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::BVH));
-    }
-}
-
-void wp_cubql_bvh_destroy_device(uint64_t id)
-{
-    wp::BVH bvh;
-    if (wp::bvh_get_descriptor(id, bvh)) {
-        wp::cubql_bvh_destroy_device(bvh);
-        wp::bvh_rem_descriptor(id);
-        wp_free_device(WP_CURRENT_CONTEXT, (void*)id);
-    }
-}

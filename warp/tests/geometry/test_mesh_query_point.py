@@ -333,9 +333,12 @@ def test_mesh_query_point(test, device):
     mesh_indices = wp.array(np.array(tri_indices), dtype=int, device=device)
 
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -747,9 +750,12 @@ def test_mesh_query_furthest_point(test, device):
     mesh_indices = wp.array(np.array(tri_indices), dtype=int, device=device)
 
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     for constructor in constructors:
         # create mesh

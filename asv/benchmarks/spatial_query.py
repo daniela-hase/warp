@@ -423,10 +423,10 @@ class BvhAABBQuery:
             )
 
             if leaf_size == 0:
-                self.bvh = wp.Bvh(self.lowers, self.uppers)
+                self.bvh = wp.Bvh(self.lowers, self.uppers, constructor=bvh_constructor)
                 self.mesh = wp.Mesh(self.points, wp.array(indices, dtype=int), bvh_constructor=bvh_constructor)
             else:
-                self.bvh = wp.Bvh(self.lowers, self.uppers, leaf_size=leaf_size)
+                self.bvh = wp.Bvh(self.lowers, self.uppers, leaf_size=leaf_size, constructor=bvh_constructor)
                 self.mesh = wp.Mesh(
                     self.points, wp.array(indices, dtype=int), bvh_leaf_size=leaf_size, bvh_constructor=bvh_constructor
                 )

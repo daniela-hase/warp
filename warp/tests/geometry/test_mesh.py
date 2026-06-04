@@ -223,9 +223,12 @@ def query_ray_group_kernel(
 
 def test_mesh_query_ray(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -315,9 +318,12 @@ def query_ray_hit_kernel(
 
 def test_mesh_refit(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     # Ray aimed at the origin — hits the unit cube centered there
     origin = wp.vec3(0.0, 5.0, 0.0)

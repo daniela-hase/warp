@@ -733,12 +733,12 @@ void bvh_refit_recursive(BVH& bvh, int index)
 void bvh_refit_host(BVH& bvh) { bvh_refit_recursive(bvh, *bvh.root); }
 void bvh_rebuild_host(BVH& bvh, int constructor_type)
 {
-    if (constructor_type == CUBQL_CONSTRUCTOR_TYPE) {
+    if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (bvh.item_groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
             return;
         }
-        if (bvh.constructor_type != CUBQL_CONSTRUCTOR_TYPE) {
+        if (bvh.constructor_type != BVH_CONSTRUCTOR_CUBQL) {
             wp::set_error_string("Warp error: cannot rebuild a non-cuBQL BVH with cuBQL construction in place");
             return;
         }
@@ -747,7 +747,7 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
         return;
     }
 
-    if (bvh.constructor_type == CUBQL_CONSTRUCTOR_TYPE) {
+    if (bvh.constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         wp::set_error_string("Warp error: cannot rebuild a cuBQL BVH with a different constructor in place");
         return;
     }
@@ -791,7 +791,7 @@ void bvh_create_host(
     vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size, BVH& bvh
 )
 {
-    if (constructor_type == CUBQL_CONSTRUCTOR_TYPE) {
+    if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
             memset(&bvh, 0, sizeof(BVH));

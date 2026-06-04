@@ -271,7 +271,7 @@ uint64_t wp_mesh_create_device(
     ContextGuard guard(context);
 
     wp::Mesh mesh(points, velocities, indices, num_points, num_tris);
-    const bool use_cubql = (constructor_type == CUBQL_CONSTRUCTOR_TYPE);
+    const bool use_cubql = (constructor_type == BVH_CONSTRUCTOR_CUBQL);
 
     mesh.context = context ? context : wp_cuda_context_get_current();
 

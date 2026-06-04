@@ -279,9 +279,12 @@ def load_mesh():
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
 def test_mesh_query_aabb_count_overlap_with_checksum(test, device):
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     leaf_sizes = [1, 2, 4]
 
@@ -402,9 +405,12 @@ def test_tile_mesh_query_aabb(test, device):
 
     # Cover the cuBQL constructor alongside the default Warp BVH path.
     if device.is_cpu:
-        constructors = ["sah", "median", "cubql"]
+        constructors = ["sah", "median"]
     else:
-        constructors = ["sah", "median", "lbvh", "cubql"]
+        constructors = ["sah", "median", "lbvh"]
+
+    if wp.is_cubql_available():
+        constructors.append("cubql")
 
     query_lower = wp.vec3(0.2, 0.2, -0.5)
     query_upper = wp.vec3(0.8, 0.8, 0.5)

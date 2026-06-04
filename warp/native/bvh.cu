@@ -628,7 +628,7 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     // contiguous child-pair layout (root at 0, children at offset/offset+1)
     // and hurts ray traversal cache behaviour. Grouped BVHs are already
     // reordered by the builder so they don't need it either.
-    if (!bvh_host.item_groups && bvh_host.constructor_type != CUBQL_CONSTRUCTOR_TYPE) {
+    if (!bvh_host.item_groups && bvh_host.constructor_type != BVH_CONSTRUCTOR_CUBQL) {
         reorder_top_down_bvh(bvh_host);
     }
 
@@ -664,7 +664,7 @@ void bvh_create_device(
 )
 {
     ContextGuard guard(context);
-    if (constructor_type == CUBQL_CONSTRUCTOR_TYPE) {
+    if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
             memset(&bvh_device_on_host, 0, sizeof(BVH));
@@ -791,9 +791,9 @@ void bvh_rebuild_device(BVH& bvh)
 {
     ContextGuard guard(bvh.context);
 
-    if (bvh.constructor_type == CUBQL_CONSTRUCTOR_TYPE) {
+    if (bvh.constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         cubql_bvh_rebuild_device(bvh);
-        bvh.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
+        bvh.constructor_type = BVH_CONSTRUCTOR_CUBQL;
         return;
     }
 
@@ -825,7 +825,7 @@ void wp_bvh_rebuild_device(uint64_t id)
         // A cuBQL rebuild reallocates the device buffers, so the BVH struct (pointers
         // and sizes) changes; an in-place LBVH rebuild reuses its buffers, leaving the
         // struct unchanged.
-        const bool was_cubql = (bvh.constructor_type == CUBQL_CONSTRUCTOR_TYPE);
+        const bool was_cubql = (bvh.constructor_type == BVH_CONSTRUCTOR_CUBQL);
 
         wp::bvh_rebuild_device(bvh);
 

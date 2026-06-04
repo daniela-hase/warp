@@ -409,7 +409,7 @@ void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_s
     bvh.item_uppers = uppers;
     bvh.num_items = num_items;
     bvh.leaf_size = leaf_size;
-    bvh.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
+    bvh.constructor_type = BVH_CONSTRUCTOR_CUBQL;
     bvh.context = nullptr;
 
     if (num_items <= 0)
@@ -418,14 +418,29 @@ void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_s
     cuBQL::box3f* boxes = new cuBQL::box3f[num_items];
     cubql_update_host_boxes(bvh, boxes);
 
-    cuBQL::bvh3f native;
-    cuBQL::BuildConfig build_config;
-    build_config.enableSAH();
-    build_config.makeLeafThreshold = leaf_size;
-    cuBQL::cpuBuilder(native, boxes, uint32_t(num_items), build_config);
-    cubql_copy_to_native_host_bvh(bvh, native);
-    bvh.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
-    cuBQL::cpu::freeBVH(native);
+    auto free_partial_bvh = [&]() { bvh_destroy_host(bvh); };
+
+    cuBQL::bvh3f native {};
+    try {
+        cuBQL::BuildConfig build_config;
+        build_config.enableSAH();
+        build_config.makeLeafThreshold = leaf_size;
+        cuBQL::cpuBuilder(native, boxes, uint32_t(num_items), build_config);
+        if (!cubql_copy_to_native_host_bvh(bvh, native))
+            free_partial_bvh();
+    } catch (const std::exception& e) {
+        wp::set_error_string("Warp error: cuBQL BVH build failed: %s", e.what());
+        free_partial_bvh();
+    } catch (...) {
+        wp::set_error_string("Warp error: cuBQL BVH build failed: unknown exception");
+        free_partial_bvh();
+    }
+
+    bvh.constructor_type = BVH_CONSTRUCTOR_CUBQL;
+
+    if (native.nodes || native.primIDs)
+        cuBQL::cpu::freeBVH(native);
+
     delete[] boxes;
 }
 
@@ -456,7 +471,7 @@ void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_s
 {
     wp::set_error_string("Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)");
     memset(&bvh, 0, sizeof(BVH));
-    bvh.constructor_type = CUBQL_CONSTRUCTOR_TYPE;
+    bvh.constructor_type = BVH_CONSTRUCTOR_CUBQL;
 }
 
 void cubql_bvh_destroy_host(BVH&) { }
@@ -466,53 +481,3 @@ void cubql_bvh_rebuild_host(BVH&) { }
 #endif  // WP_DISABLE_CUBQL
 
 }  // namespace wp
-
-
-uint64_t wp_cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_size)
-{
-    BVH* bvh = new BVH();
-    memset(bvh, 0, sizeof(BVH));
-    wp::cubql_bvh_create_host(lowers, uppers, num_items, leaf_size, *bvh);
-#ifdef WP_DISABLE_CUBQL
-    delete bvh;
-    return 0;
-#endif
-    if (!bvh->node_lowers && num_items > 0) {
-        delete bvh;
-        return 0;
-    }
-    return (uint64_t)bvh;
-}
-
-void wp_cubql_bvh_refit_host(uint64_t id)
-{
-    BVH* bvh = (BVH*)(id);
-    wp::cubql_bvh_refit_host(*bvh);
-}
-
-void wp_cubql_bvh_rebuild_host(uint64_t id)
-{
-    BVH* bvh = (BVH*)(id);
-    wp::cubql_bvh_rebuild_host(*bvh);
-}
-
-void wp_cubql_bvh_destroy_host(uint64_t id)
-{
-    BVH* bvh = (BVH*)(id);
-    wp::cubql_bvh_destroy_host(*bvh);
-    delete bvh;
-}
-
-
-// stubs for non-CUDA platforms (matching cuBQL device entry points)
-#if !WP_ENABLE_CUDA
-
-uint64_t wp_cubql_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size)
-{
-    return 0;
-}
-void wp_cubql_bvh_refit_device(uint64_t id) { }
-void wp_cubql_bvh_destroy_device(uint64_t id) { }
-void wp_cubql_bvh_rebuild_device(uint64_t id) { }
-
-#endif  // !WP_ENABLE_CUDA
