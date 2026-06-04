@@ -2506,20 +2506,76 @@ CUDA_CALLABLE inline void adj_mesh_query_ray(
     );
 }
 
+
+// Flat-stack closest-hit traversal that returns only the sign of the closest
+// hit. Used by mesh_query_inside_ray_tracing for the three axis-aligned probe
+// rays: those rays penetrate the whole mesh and rarely allow pruning, so the
+// eager-child-loading overhead of the near-far mesh_query_ray traversal is not
+// worth paying. This function uses the classic push-both-children approach,
+// which has half the BVH node loads per inner step.
+CUDA_CALLABLE inline bool
+mesh_query_ray_closest_sign(const Mesh& mesh, const vec3& start, const vec3& dir, float& out_sign)
+{
+    int stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    int node_index = *mesh.bvh.root;
+
+    vec3 rcp_dir = safe_ray_rcp_dir(dir);
+    float min_t = FLT_MAX;
+    float temp_t;
+    bool hit = false;
+
+    while (true) {
+        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+
+        if (intersect_ray_aabb(start, rcp_dir, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z), temp_t)
+            && temp_t < min_t) {
+            if (lower.b) {
+                for (int pc = lower.i; pc < upper.i; ++pc) {
+                    int primitive_index = mesh.bvh.primitive_indices[pc];
+                    int i = mesh.indices[primitive_index * 3 + 0];
+                    int j = mesh.indices[primitive_index * 3 + 1];
+                    int k = mesh.indices[primitive_index * 3 + 2];
+
+                    vec3 p = mesh.points[i];
+                    vec3 q = mesh.points[j];
+                    vec3 r = mesh.points[k];
+
+                    float tri_t, tri_u, tri_v, tri_sign;
+                    vec3 n;
+
+                    if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
+                        if (tri_t >= 0.0f && tri_t < min_t) {
+                            min_t = tri_t;
+                            out_sign = tri_sign;
+                            hit = true;
+                        }
+                    }
+                }
+            } else {
+                stack[stack_size++] = lower.i;
+                stack[stack_size++] = upper.i;
+            }
+        }
+
+        if (stack_size == 0)
+            break;
+        node_index = stack[--stack_size];
+    }
+    return hit;
+}
+
 // determine if a point is inside (ret < 0 ) or outside the mesh (ret > 0) using ray tracing
 CUDA_CALLABLE inline float mesh_query_inside_ray_tracing(uint64_t id, const vec3& p)
 {
-    float t, u, v, sign;
-    vec3 n;
-    int face;
+    Mesh mesh = mesh_get(id);
 
     int vote = 0;
+    float sign;
 
     for (int i = 0; i < 3; ++i) {
-        if (mesh_query_ray(
-                id, p, vec3(float(i == 0), float(i == 1), float(i == 2)), FLT_MAX, t, u, v, sign, n, face, -1
-            )
-            && sign < 0) {
+        if (mesh_query_ray_closest_sign(mesh, p, vec3(float(i == 0), float(i == 1), float(i == 2)), sign) && sign < 0) {
             vote++;
         }
     }
