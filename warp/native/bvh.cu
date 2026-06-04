@@ -822,9 +822,23 @@ void wp_bvh_rebuild_device(uint64_t id)
     if (bvh_get_descriptor(id, bvh)) {
         ContextGuard guard(bvh.context);
 
+        // A cuBQL rebuild reallocates the device buffers, so the BVH struct (pointers
+        // and sizes) changes; an in-place LBVH rebuild reuses its buffers, leaving the
+        // struct unchanged.
+        const bool was_cubql = (bvh.constructor_type == CUBQL_CONSTRUCTOR_TYPE);
+
         wp::bvh_rebuild_device(bvh);
+
+        // Refresh the host-side descriptor in case any fields changed.
         wp::bvh_add_descriptor(id, bvh);
-        wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::BVH));
+
+        // Only the cuBQL path needs the device-side descriptor refreshed. The host->device
+        // copy of pageable memory is not CUDA-graph-capture safe, so we must skip it for the
+        // in-place LBVH rebuild to keep grouped/LBVH rebuilds capture-safe (its device struct
+        // is unchanged anyway).
+        if (was_cubql) {
+            wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::BVH));
+        }
     }
 }
 
