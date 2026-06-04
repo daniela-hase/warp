@@ -410,14 +410,14 @@ def test_mesh_exceptions(test, device):
         indices = indices.reshape((3, -1))
         wp.Mesh(points=points, indices=indices)
 
-    # grouped queries are not supported with cuBQL backend
+    # grouped queries are not supported with the cuBQL constructor
     with test.assertRaises(RuntimeError):
         points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device=device)
         indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device=device)
         groups = wp.zeros(FACE_COUNT, dtype=int, device=device)
         wp.Mesh(points=points, indices=indices, groups=groups, bvh_constructor="cubql")
 
-    # winding number support is not available with cuBQL backend
+    # winding number support is not available with the cuBQL constructor
     with test.assertRaises(RuntimeError):
         points = wp.array(POINT_POSITIONS, dtype=wp.vec3, device=device)
         indices = wp.array(RIGHT_HANDED_FACE_VERTEX_INDICES, dtype=int, device=device)

@@ -58,6 +58,9 @@
   - Per-cell environment metadata for unstructured FEM meshes with grouped-BVH lookup and nonconforming field
     evaluation
   - Environment-first space partitions for batched solves, plus a multi-environment APIC fluid example
+- Add `constructor="cubql"` support to `wp.Bvh` and allow `wp.Mesh(..., bvh_constructor="cubql")`
+  to use AABB, point, furthest-point, and ray queries when Warp is built with cuBQL.
+  Grouped BVHs/meshes and mesh winding-number queries remain unsupported.
 
 ### Removed
 
