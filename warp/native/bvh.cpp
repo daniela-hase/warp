@@ -786,7 +786,6 @@ void bvh_add_descriptor(uint64_t id, const BVH& bvh) { g_bvh_descriptors[id] = b
 void bvh_rem_descriptor(uint64_t id) { g_bvh_descriptors.erase(id); }
 
 
-
 // create in-place given existing descriptor
 void bvh_create_host(
     vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size, BVH& bvh

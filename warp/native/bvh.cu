@@ -872,4 +872,3 @@ void wp_bvh_destroy_device(uint64_t id)
         wp_free_device(WP_CURRENT_CONTEXT, (void*)id);
     }
 }
-
