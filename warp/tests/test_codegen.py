@@ -3,6 +3,7 @@
 
 import ast
 import inspect
+import linecache
 import sys
 import unittest
 from unittest import mock
@@ -1415,7 +1416,98 @@ def test_rebind_function_local_to_value_errors(test, device):
         )
 
 
+@wp.func
+def gradwrapper_rebind_square(x: float):
+    return x * x
+
+
+def test_rebind_gradwrapper_local_to_value_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_to_value_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g = 1.0
+        out[0] = g
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_to_value_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+def test_rebind_gradwrapper_local_through_tuple_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_through_tuple_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g, x = (1.0, 2.0)
+        out[0] = x
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_through_tuple_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
+def test_rebind_gradwrapper_local_through_augassign_errors(test, device):
+    @wp.kernel(enable_backward=False, module="unique")
+    def rebind_gradwrapper_local_through_augassign_kernel(out: wp.array(dtype=float)):
+        g = wp.grad(gradwrapper_rebind_square)
+        g += 1.0
+        out[0] = 1.0
+
+    with test.assertRaisesRegex(wp.WarpCodegenError, "Cannot reassign local 'g'.*wp.grad"):
+        wp.launch(
+            rebind_gradwrapper_local_through_augassign_kernel,
+            dim=1,
+            outputs=[wp.zeros(1, dtype=float, device=device)],
+            device=device,
+        )
+
+
 class TestCodeGen(unittest.TestCase):
+    def _make_adjoint_with_filename(self, filename):
+        source = "def kernel_fn(x: int):\n    y = x + 1\n    return y\n"
+        linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+        namespace = {}
+        try:
+            exec(compile(source, filename, "exec"), namespace)
+            adj = wp._src.codegen.Adjoint(namespace["kernel_fn"])
+            adj.builder_options = {"lineinfo": True, "line_directives": True, "mode": "release"}
+            return adj
+        finally:
+            linecache.cache.pop(filename, None)
+
+    def test_line_directive_escapes_filename(self):
+        import os  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(tmpdir, 'warp_poc"\n\r\t\x00\x1f\x7fint injected_from_filename;\n//.py')
+            adj = self._make_adjoint_with_filename(os.path.join(tmpdir, "warp_poc.py"))
+            adj.filename = filename
+
+            directive = adj.get_line_directive("int x;", 0)
+
+            normalized_dir = tmpdir.replace("\\", "/")
+            self.assertEqual(
+                directive,
+                f'#line 1 "{normalized_dir}/warp_poc\\"\\n\\r\\t\\000\\037\\177int injected_from_filename;\\n//.py"',
+            )
+            self.assertEqual(directive.count("\n"), 0)
+
+    def test_line_directive_preserves_normalized_path(self):
+        filename = "C:\\warp\\kernels\\example.py"
+        adj = self._make_adjoint_with_filename(filename)
+
+        directive = adj.get_line_directive("int x;", 0)
+
+        self.assertEqual(directive, '#line 1 "C:/warp/kernels/example.py"')
+
     def test_extract_function_source_slow_path_when_fast_returns_none(self):
         """When ``_try_extract_function_source`` returns ``None`` (e.g. for an
         ``exec``-defined function with no linecache entry), ``extract_function_source``
@@ -1892,6 +1984,24 @@ add_function_test(
     TestCodeGen,
     "test_rebind_function_local_to_value_errors",
     test_rebind_function_local_to_value_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_to_value_errors",
+    test_rebind_gradwrapper_local_to_value_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_through_tuple_errors",
+    test_rebind_gradwrapper_local_through_tuple_errors,
+    devices=devices,
+)
+add_function_test(
+    TestCodeGen,
+    "test_rebind_gradwrapper_local_through_augassign_errors",
+    test_rebind_gradwrapper_local_through_augassign_errors,
     devices=devices,
 )
 

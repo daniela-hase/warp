@@ -18,6 +18,7 @@ import re
 import textwrap
 import threading
 import types
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, get_args, get_origin
 
@@ -30,6 +31,28 @@ _wp_module_name_ = "warp.codegen"
 # used as a globally accessible copy
 # of current compile options (block_dim) etc
 options = {}
+
+
+def _escape_line_directive_filename(filename: str) -> str:
+    """Return ``filename`` escaped for the quoted filename field of a C/CUDA ``#line`` directive."""
+
+    escaped = []
+    for c in filename.replace("\\", "/"):
+        if c == '"':
+            escaped.append('\\"')
+        elif c == "\n":
+            escaped.append("\\n")
+        elif c == "\r":
+            escaped.append("\\r")
+        elif c == "\t":
+            escaped.append("\\t")
+        elif ord(c) < 32 or ord(c) == 127:
+            # Use fixed-width octal so following filename characters cannot be consumed by the escape.
+            escaped.append(f"\\{ord(c):03o}")
+        else:
+            escaped.append(c)
+
+    return "".join(escaped)
 
 
 def get_node_name_safe(node):
@@ -308,33 +331,25 @@ def _is_tid_call(node) -> bool:
 
 
 def iter_ast_nodes_of_types(root: ast.AST, *types: type):
-    """Yield only the AST nodes whose exact type is in ``types``, in depth-first search (DFS) order.
+    """Like ``(n for n in ast.walk(root) if type(n) in types)`` but faster.
 
-    Equivalent to ``(n for n in ast.walk(root) if type(n) in types)`` but
-    faster: ``ast.walk`` is a Python generator over ``iter_child_nodes``;
-    this version inlines the field iteration. Uses ``type(node) in types``
-    (exact-type match) rather than ``isinstance`` (subclass check), which is
-    safe because AST node classes are never subclassed in practice.
+    Inlines ``ast.walk``'s field iteration over a ``deque``, preserving its
+    breadth-first order, so it is a drop-in even where order matters. Exact-type
+    match; AST node classes are never subclassed in practice.
     """
-    if type(root) in types:
-        yield root
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    todo = deque((root,))
+    while todo:
+        node = todo.popleft()
+        if type(node) in types:
+            yield node
         for field in node._fields:
             value = getattr(node, field, None)
-            if value is None:
-                continue
             if type(value) is list:
                 for child in value:
                     if isinstance(child, ast.AST):
-                        if type(child) in types:
-                            yield child
-                        stack.append(child)
+                        todo.append(child)
             elif isinstance(value, ast.AST):
-                if type(value) in types:
-                    yield value
-                stack.append(value)
+                todo.append(value)
 
 
 def _is_texture_type(var_type: type) -> bool:
@@ -370,10 +385,12 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
             setattr(inst._ctype, field, array_t())
         else:
             # wp.array
-            assert isinstance(value, array)
-            assert types_equal(value.dtype, var_type.dtype), (
-                f"assign to struct member variable {field} failed, expected type {type_repr(var_type.dtype)}, got type {type_repr(value.dtype)}"
-            )
+            if not isinstance(value, array):
+                raise TypeError(f"Struct field '{field}' expects a Warp array, got {type(value).__name__}")
+            if not types_equal(value.dtype, var_type.dtype):
+                raise TypeError(
+                    f"Struct field '{field}' expects dtype {type_repr(var_type.dtype)}, got {type_repr(value.dtype)}"
+                )
             setattr(inst._ctype, field, value.__ctype__())
 
             # workaround to prevent gradient buffers being garbage collected
@@ -388,10 +405,12 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
         if value is None:
             setattr(inst._ctype, field, var_type.__ctype__())
         else:
-            assert isinstance(value, indexedarray)
-            assert types_equal(value.dtype, var_type.dtype), (
-                f"assign to struct member variable {field} failed, expected type {type_repr(var_type.dtype)}, got type {type_repr(value.dtype)}"
-            )
+            if not isinstance(value, indexedarray):
+                raise TypeError(f"Struct field '{field}' expects a Warp indexed array, got {type(value).__name__}")
+            if not types_equal(value.dtype, var_type.dtype):
+                raise TypeError(
+                    f"Struct field '{field}' expects dtype {type_repr(var_type.dtype)}, got {type_repr(value.dtype)}"
+                )
             setattr(inst._ctype, field, value.__ctype__())
 
         # workaround to prevent gradient buffers being garbage collected
@@ -1139,22 +1158,6 @@ class Adjoint:
         # for unit testing errors being spit out from kernels.
         adj.skip_build = False
 
-        # Infer kernel_dim before hashing because it selects the
-        # ``launch_bounds_t<N>`` type in generated C++.
-        adj.kernel_dim = adj._infer_kernel_dim()
-
-    def _infer_kernel_dim(adj) -> int:
-        max_dim = 0
-        for node in ast.walk(adj.tree):
-            if isinstance(node, ast.Assign) and _is_tid_call(node.value):
-                target = node.targets[0]
-                if isinstance(target, ast.Tuple):
-                    max_dim = max(max_dim, len(target.elts))
-                else:
-                    max_dim = max(max_dim, 1)
-
-        return max_dim if max_dim > 0 else 1
-
     # allocate extra space for a function call that requires its
     # own shared memory space, we treat shared memory as a stack
     # where each function pushes and pops space off, the extra
@@ -1591,9 +1594,8 @@ class Adjoint:
             is_comment = statement.strip().startswith("//")
             if not is_comment:
                 line = relative_lineno + adj.fun_lineno
-                # Convert backslashes to forward slashes for CUDA compatibility
-                normalized_path = adj.filename.replace("\\", "/")
-                return f'#line {line} "{normalized_path}"'
+                escaped_path = _escape_line_directive_filename(adj.filename)
+                return f'#line {line} "{escaped_path}"'
         return None
 
     def add_forward(adj, statement: str, replay: str | None = None, skip_replay: builtins.bool = False) -> None:
@@ -3428,6 +3430,13 @@ class Adjoint:
             out = rhs
             for name, rhs in zip(names, out, strict=True):
                 if name in adj.symbols:
+                    if isinstance(adj.symbols[name], warp._src.context.GradWrapper):
+                        raise WarpCodegenError(
+                            f"Cannot reassign local '{name}' after binding it to wp.grad(...). Warp treats "
+                            "wp.grad(...) results as static function handles; use a different local variable "
+                            "for the new value."
+                        )
+
                     if not types_equal(rhs.type, adj.symbols[name].type):
                         raise WarpCodegenTypeError(
                             f"Error, assigning to existing symbol {name} ({adj.symbols[name].type}) with different type ({rhs.type})"
@@ -3493,6 +3502,13 @@ class Adjoint:
                         f"Error, rebinding function-valued local '{name}' to a non-function value is not "
                         "supported. Warp does not have function pointers, so a local bound to a function "
                         "must refer to a function throughout the kernel."
+                    )
+
+                if isinstance(adj.symbols[name], warp._src.context.GradWrapper):
+                    raise WarpCodegenError(
+                        f"Cannot reassign local '{name}' after binding it to wp.grad(...). Warp treats "
+                        "wp.grad(...) results as static function handles; use a different local variable "
+                        "for the new value."
                     )
 
                 if not types_equal(strip_reference(rhs.type), adj.symbols[name].type):
@@ -3955,6 +3971,12 @@ class Adjoint:
         if isinstance(lhs, ast.Name):
             rhs = adj.eval(node.value)
             target = adj.eval(lhs)
+            if isinstance(target, warp._src.context.GradWrapper):
+                raise WarpCodegenError(
+                    f"Cannot reassign local '{lhs.id}' after binding it to wp.grad(...). Warp treats "
+                    "wp.grad(...) results as static function handles; use a different local variable "
+                    "for the new value."
+                )
 
             # In-place tile ops mutate target directly; no symbol table update needed.
             if is_tile(target.type) and is_tile(rhs.type):
@@ -4649,15 +4671,23 @@ class Adjoint:
         return ast.get_source_segment(adj.source, node)
 
     def get_references(adj) -> tuple[dict[str, Any], dict[Any, Any], dict[warp._src.context.Function, Any]]:
-        """Traverses ``adj.tree`` and returns referenced constants, types, and user-defined functions."""
+        """Traverse ``adj.tree`` for referenced constants, types, and user-defined functions.
+
+        As a side effect, also sets ``adj.kernel_dim`` (the thread-grid dimension inferred from
+        ``wp.tid()``). It is folded into this traversal rather than walked separately because
+        ``get_references`` already visits every ``Assign`` and runs for every adjoint during
+        module hashing -- which precedes any code generation or launch that reads ``kernel_dim``.
+        """
 
         local_variables = set()  # Track local variables appearing on the LHS so we know when variables are shadowed
 
         constants: dict[str, Any] = {}
         types: dict[Struct | type, Any] = {}
         functions: dict[warp._src.context.Function, Any] = {}
+        max_dim = 0  # thread-grid dimension, inferred from wp.tid() unpack arity
 
-        for node in ast.walk(adj.tree):
+        # Faster, order-preserving drop-in for ast.walk; runs for every adjoint during hashing.
+        for node in iter_ast_nodes_of_types(adj.tree, ast.Name, ast.Attribute, ast.Call, ast.Assign):
             if isinstance(node, ast.Name) and node.id not in local_variables:
                 # look up in closure/global variables
                 obj = adj.resolve_external_reference(node.id)
@@ -4682,6 +4712,11 @@ class Adjoint:
                     types[func] = None
 
             elif isinstance(node, ast.Assign):
+                # Infer the thread-grid dimension from `i[, j, ...] = wp.tid()` unpack arity.
+                if _is_tid_call(node.value):
+                    target = node.targets[0]
+                    max_dim = max(max_dim, len(target.elts) if isinstance(target, ast.Tuple) else 1)
+
                 # A function bound to a local (`f = mod.func`) or to several locals via tuple
                 # unpacking (`f, g = mod.a, mod.b`) is referenced only through the local(s)
                 # afterwards, so it would otherwise be missed here and left out of the module
@@ -4701,6 +4736,7 @@ class Adjoint:
                 elif isinstance(lhs, ast.Name):
                     local_variables.add(lhs.id)
 
+        adj.kernel_dim = max_dim if max_dim > 0 else 1
         return constants, types, functions
 
 

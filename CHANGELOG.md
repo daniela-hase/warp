@@ -149,6 +149,11 @@
 - Speed up Warp kernel creation, particularly for workloads that declare many kernels
   programmatically (e.g. dynamic factory patterns)
   ([GH-1486](https://github.com/NVIDIA/warp/issues/1486)).
+- **Breaking:** A version mismatch between the Warp Python package and its native libraries
+  (`warp.dll` / `warp-clang.dll` and platform equivalents) now raises an error during
+  `wp.init()` instead of a warning that allowed execution to continue. A missing or unreadable
+  version symbol in a loaded native library is treated the same way
+  ([GH-1508](https://github.com/NVIDIA/warp/issues/1508)).
 
 ### Fixed
 
@@ -226,6 +231,12 @@
 - Fix CUDA BVH refit out-of-bounds access for single-node and packed-root
   trees ([GH-860](https://github.com/NVIDIA/warp/issues/860),
   [GH-1506](https://github.com/NVIDIA/warp/issues/1506)).
+- Fix rebinding a kernel-local variable that holds `wp.grad()` to a non-grad
+  value to raise a clear `WarpCodegenError` instead of an internal
+  `AttributeError` ([GH-1487](https://github.com/NVIDIA/warp/issues/1487)).
+- Fix `Tape.record_scope_end()` to raise a clear error for unmatched
+  scope ends and preserve nested non-empty tape visualization scopes
+  ([GH-1515](https://github.com/NVIDIA/warp/issues/1515)).
 
 ### Documentation
 
