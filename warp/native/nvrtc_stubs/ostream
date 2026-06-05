@@ -1,0 +1,18 @@
+// NVRTC stub for <ostream>.
+// Provides a dummy std::ostream so headers that declare host-only operator<<
+// overloads compile without instantiating them.
+#pragma once
+#include <string>
+
+namespace std {
+
+struct ostream {
+    ostream& operator<<(const char*)  { return *this; }
+    ostream& operator<<(int)          { return *this; }
+    ostream& operator<<(unsigned int) { return *this; }
+    ostream& operator<<(float)        { return *this; }
+    ostream& operator<<(double)       { return *this; }
+    ostream& operator<<(const string&){ return *this; }
+};
+
+} // namespace std

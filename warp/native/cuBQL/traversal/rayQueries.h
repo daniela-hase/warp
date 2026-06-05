@@ -333,7 +333,12 @@ namespace cuBQL {
   struct ChildOrder {
     inline __cubql_both void clear(int i) { v[i] = (uint64_t)-1; }
     inline __cubql_both void set(int i, float dist, uint32_t payload) {
+#ifdef __CUDA_ARCH__
         v[i] = (uint64_t(__float_as_int(dist)) << 32) | payload;
+#else
+        union { float f; uint32_t u; } fu; fu.f = dist;
+        v[i] = ((uint64_t)fu.u << 32) | payload;
+#endif
     }
     uint64_t v[N];
   };

@@ -1,0 +1,81 @@
+// NVRTC stub for <type_traits> — self-contained, no cuda/std dependency.
+#pragma once
+
+namespace std {
+
+// is_same
+template<typename A, typename B> struct is_same          { static const bool value = false; };
+template<typename A>             struct is_same<A, A>    { static const bool value = true;  };
+
+// remove_cv
+template<typename T>          struct remove_cv           { typedef T type; };
+template<typename T>          struct remove_cv<const T>  { typedef T type; };
+template<typename T>          struct remove_cv<volatile T>{ typedef T type; };
+template<typename T>          struct remove_cv<const volatile T>{ typedef T type; };
+
+// remove_reference
+template<typename T> struct remove_reference      { typedef T type; };
+template<typename T> struct remove_reference<T&>  { typedef T type; };
+template<typename T> struct remove_reference<T&&> { typedef T type; };
+
+// remove_const
+template<typename T>       struct remove_const          { typedef T type; };
+template<typename T>       struct remove_const<const T> { typedef T type; };
+
+// decay (simplified: strip reference + cv; no array/function decay needed here)
+template<typename T> struct decay {
+    typedef typename remove_cv<typename remove_reference<T>::type>::type type;
+};
+
+// enable_if
+template<bool B, typename T = void> struct enable_if {};
+template<typename T>                struct enable_if<true, T> { typedef T type; };
+
+// conditional
+template<bool B, typename T, typename F> struct conditional              { typedef T type; };
+template<typename T, typename F>         struct conditional<false, T, F> { typedef F type; };
+
+// integral_constant
+template<typename T, T V>
+struct integral_constant {
+    static const T value = V;
+    typedef T value_type;
+    typedef integral_constant type;
+    operator value_type() const { return value; }
+};
+typedef integral_constant<bool, true>  true_type;
+typedef integral_constant<bool, false> false_type;
+
+// is_integral
+template<typename T> struct is_integral_helper : false_type {};
+template<> struct is_integral_helper<bool>               : true_type {};
+template<> struct is_integral_helper<char>               : true_type {};
+template<> struct is_integral_helper<signed char>        : true_type {};
+template<> struct is_integral_helper<unsigned char>      : true_type {};
+template<> struct is_integral_helper<short>              : true_type {};
+template<> struct is_integral_helper<unsigned short>     : true_type {};
+template<> struct is_integral_helper<int>                : true_type {};
+template<> struct is_integral_helper<unsigned int>       : true_type {};
+template<> struct is_integral_helper<long>               : true_type {};
+template<> struct is_integral_helper<unsigned long>      : true_type {};
+template<> struct is_integral_helper<long long>          : true_type {};
+template<> struct is_integral_helper<unsigned long long> : true_type {};
+
+template<typename T>
+struct is_integral : is_integral_helper<typename remove_cv<T>::type> {};
+
+// is_floating_point
+template<typename T> struct is_floating_point_helper : false_type {};
+template<> struct is_floating_point_helper<float>       : true_type {};
+template<> struct is_floating_point_helper<double>      : true_type {};
+template<> struct is_floating_point_helper<long double> : true_type {};
+
+template<typename T>
+struct is_floating_point : is_floating_point_helper<typename remove_cv<T>::type> {};
+
+// is_arithmetic
+template<typename T>
+struct is_arithmetic : integral_constant<bool,
+    is_integral<T>::value || is_floating_point<T>::value> {};
+
+} // namespace std

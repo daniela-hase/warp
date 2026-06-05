@@ -1,0 +1,9 @@
+// NVRTC stub for <cuda/std/limits>.
+// Defers to our self-contained <limits> stub and aliases into cuda::std.
+#pragma once
+#include <limits>
+namespace cuda {
+  namespace std {
+    using ::std::numeric_limits;
+  }
+}

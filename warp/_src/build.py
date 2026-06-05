@@ -48,7 +48,9 @@ def build_cuda(
         src = src_file.read()
     cu_path_bytes = cu_path.encode("utf-8")
     program_name_bytes = os.path.basename(cu_path).encode("utf-8")
-    inc_path = os.path.join(warp_home, "native").encode("utf-8")
+    native_dir = os.path.join(warp_home, "native")
+    nvrtc_stubs_dir = os.path.join(native_dir, "nvrtc_stubs")
+    inc_path = native_dir.encode("utf-8")
     output_path = output_path.encode("utf-8")
 
     if llvm_cuda:
@@ -72,14 +74,27 @@ def build_cuda(
         # isolated between threads and processes to avoid .pch races.
         pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
         arch_suffix_bytes = arch_suffix.encode("utf-8")
+        # NVRTC-safe stubs: put the stubs dir first so its overrides of host-heavy
+        # vendor headers (e.g. cuBQL/math/common.h) shadow the real ones.
+        # warp/native is then appended as a secondary path for all other headers.
+        # warp.cu appends cuda_include_dirs *after* include_dir, so we swap roles:
+        # stubs → include_dir (first slot), warp/native → cuda_include_dirs[0].
+        if os.path.isdir(nvrtc_stubs_dir):
+            nvrtc_inc = nvrtc_stubs_dir.encode("utf-8")
+            extra_inc_dirs = [native_dir.encode("utf-8")]
+        else:
+            nvrtc_inc = inc_path
+            extra_inc_dirs = []
+        num_extra = len(extra_inc_dirs)
+        arr_extra = (ctypes.c_char_p * num_extra)(*extra_inc_dirs) if num_extra else None
         err = warp._src.context.runtime.core.wp_cuda_compile_program(
             src,
             program_name_bytes,
             arch,
             arch_suffix_bytes,
-            inc_path,
-            0,
-            None,
+            nvrtc_inc,
+            num_extra,
+            arr_extra,
             config == "debug",
             optimization_level,
             warp.config.verbose or warp.config.log_level <= LOG_DEBUG,

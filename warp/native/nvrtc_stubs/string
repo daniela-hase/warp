@@ -1,0 +1,26 @@
+// NVRTC stub for <string>.
+// Provides minimal std::string and std::to_string so headers that declare
+// host-only debug/print functions compile without instantiating them.
+#pragma once
+
+namespace std {
+
+struct string {
+    string() {}
+    string(const char*) {}
+    string(const string&) = default;
+    string& operator=(const string&) = default;
+    string operator+(const string& o) const { return *this; }
+    string operator+(const char*) const { return *this; }
+};
+
+inline string to_string(int)               { return string(); }
+inline string to_string(unsigned int)      { return string(); }
+inline string to_string(long)              { return string(); }
+inline string to_string(unsigned long)     { return string(); }
+inline string to_string(long long)         { return string(); }
+inline string to_string(unsigned long long){ return string(); }
+inline string to_string(float)             { return string(); }
+inline string to_string(double)            { return string(); }
+
+} // namespace std

@@ -10,6 +10,11 @@
 #include "intersect.h"
 #include "rand.h"
 #include "solid_angle.h"
+// cuBQL traversal helpers use CUDA built-ins under __CUDACC__/__CUDACC_RTC__ and
+// are not available in Warp's CPU JIT (LLVM/Clang, no __CUDACC__ defined).
+#ifdef __CUDACC__
+#include "cuBQL/traversal/rayQueries.h"
+#endif
 
 #define BVH_DEBUG 0
 
@@ -1808,22 +1813,102 @@ CUDA_CALLABLE inline int cubql_ray_traversal(
 {
     if (!mesh.cubql_bvh.nodes || !mesh.cubql_bvh.primitive_indices)
         return 0;
-
     const int root_index = mesh.cubql_bvh.root ? *mesh.cubql_bvh.root : -1;
     if (root_index < 0)
         return 0;
 
+    // Epsilon fix for zero direction components avoids division-by-zero in slab tests.
     vec3 ray_dir = dir;
-    if (ray_dir[0] == 0.0f)
-        ray_dir[0] = 1.0e-20f;
-    if (ray_dir[1] == 0.0f)
-        ray_dir[1] = 1.0e-20f;
-    if (ray_dir[2] == 0.0f)
-        ray_dir[2] = 1.0e-20f;
-    const vec3 rcp_dir = vec3(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    if (ray_dir[0] == 0.0f) ray_dir[0] = 1.0e-20f;
+    if (ray_dir[1] == 0.0f) ray_dir[1] = 1.0e-20f;
+    if (ray_dir[2] == 0.0f) ray_dir[2] = 1.0e-20f;
 
-    float prune_t = (Mode == CuBQLRayMode::CountAll) ? FLT_MAX : max_t;
     int result = 0;
+
+#ifdef __CUDACC__
+    // CUDA path (nvcc AOT and NVRTC): use cuBQL traversal helpers.
+    // CuBQLNode is binary-compatible with cuBQL::BinaryBVH<float,3>::Node (see bvh.h).
+    cuBQL::bvh3f bvh;
+    bvh.nodes    = reinterpret_cast<cuBQL::bvh3f::node_t*>(mesh.cubql_bvh.nodes);
+    bvh.numNodes = (uint32_t)mesh.cubql_bvh.num_nodes;
+    bvh.primIDs  = mesh.cubql_bvh.primitive_indices;
+    bvh.numPrims = (uint32_t)mesh.cubql_bvh.num_prims;
+
+    cuBQL::ray3f ray;
+    ray.origin.x    = start[0];   ray.origin.y    = start[1];   ray.origin.z    = start[2];
+    ray.direction.x = ray_dir[0]; ray.direction.y = ray_dir[1]; ray.direction.z = ray_dir[2];
+    ray.tMin = 0.f;
+    ray.tMax = (Mode == CuBQLRayMode::CountAll) ? FLT_MAX : max_t;
+
+    if constexpr (Mode == CuBQLRayMode::ClosestHit) {
+        // shrinkingRayQuery traverses front-to-back and prunes subtrees beyond the best hit.
+        auto perLeaf = [&](const uint32_t* primIDs, int count) -> float {
+            for (int i = 0; i < count; ++i) {
+                const int pidx = (int)primIDs[i];
+                const vec3 p = mesh.points[mesh.indices[pidx * 3 + 0]];
+                const vec3 q = mesh.points[mesh.indices[pidx * 3 + 1]];
+                const vec3 r = mesh.points[mesh.indices[pidx * 3 + 2]];
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3 tri_n;
+                if (intersect_ray_tri_woop(start, ray_dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &tri_n)) {
+                    if (tri_t >= 0.f && tri_t < ray.tMax) {
+                        ray.tMax   = tri_t;
+                        hit_t      = tri_t;  hit_face   = pidx;
+                        hit_u      = tri_u;  hit_v      = tri_v;
+                        hit_sign   = tri_sign;
+                        hit_normal = tri_n;
+                        result     = 1;
+                    }
+                }
+            }
+            return ray.tMax;
+        };
+        cuBQL::shrinkingRayQuery::forEachLeaf(perLeaf, bvh, ray);
+    } else if constexpr (Mode == CuBQLRayMode::AnyHit) {
+        // fixedRayQuery with early termination on the first hit within [0, max_t).
+        auto perLeaf = [&](const uint32_t* primIDs, int count) -> int {
+            for (int i = 0; i < count; ++i) {
+                const int pidx = (int)primIDs[i];
+                const vec3 p = mesh.points[mesh.indices[pidx * 3 + 0]];
+                const vec3 q = mesh.points[mesh.indices[pidx * 3 + 1]];
+                const vec3 r = mesh.points[mesh.indices[pidx * 3 + 2]];
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3 tri_n;
+                if (intersect_ray_tri_woop(start, ray_dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &tri_n)) {
+                    if (tri_t >= 0.f && tri_t < ray.tMax) {
+                        result = 1;
+                        return CUBQL_TERMINATE_TRAVERSAL;
+                    }
+                }
+            }
+            return CUBQL_CONTINUE_TRAVERSAL;
+        };
+        cuBQL::fixedRayQuery::forEachLeaf(perLeaf, bvh, ray);
+    } else {
+        // CountAll: ray.tMax is FLT_MAX so no distance pruning; count every forward hit.
+        auto perLeaf = [&](const uint32_t* primIDs, int count) -> int {
+            for (int i = 0; i < count; ++i) {
+                const int pidx = (int)primIDs[i];
+                const vec3 p = mesh.points[mesh.indices[pidx * 3 + 0]];
+                const vec3 q = mesh.points[mesh.indices[pidx * 3 + 1]];
+                const vec3 r = mesh.points[mesh.indices[pidx * 3 + 2]];
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3 tri_n;
+                if (intersect_ray_tri_woop(start, ray_dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &tri_n)) {
+                    if (tri_t >= 0.f)
+                        result++;
+                }
+            }
+            return CUBQL_CONTINUE_TRAVERSAL;
+        };
+        cuBQL::fixedRayQuery::forEachLeaf(perLeaf, bvh, ray);
+    }
+#else
+printf("MEOOOW!\n");
+    // CPU JIT path: self-contained traversal using only Warp-native BVH types.
+    // __CUDACC__ is not defined by LLVM/Clang, so cuBQL helpers are not available here.
+    const vec3 rcp_dir = vec3(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    float prune_t = (Mode == CuBQLRayMode::CountAll) ? FLT_MAX : max_t;
 
     uint64_t stack[CUBQL_BVH_QUERY_STACK_SIZE];
     int stack_size = 0;
@@ -1851,12 +1936,12 @@ CUDA_CALLABLE inline int cubql_ray_traversal(
                     if (Mode == CuBQLRayMode::ClosestHit) {
                         const bool n0_near = (t0 < t1);
                         if (stack_size >= CUBQL_BVH_QUERY_STACK_SIZE)
-                            return result;  // stack overflow
+                            return result;
                         stack[stack_size++] = n0_near ? n1.admin : n0.admin;
                         node_admin = n0_near ? n0.admin : n1.admin;
                     } else {
                         if (stack_size >= CUBQL_BVH_QUERY_STACK_SIZE)
-                            return result;  // stack overflow
+                            return result;
                         stack[stack_size++] = n1.admin;
                         node_admin = n0.admin;
                     }
@@ -1876,25 +1961,20 @@ CUDA_CALLABLE inline int cubql_ray_traversal(
             const uint32_t prim_offset = uint32_t(node_admin & 0x0000FFFFFFFFFFFFull);
             for (int i = 0; i < int(node_count); ++i) {
                 const int primitive_index = int(mesh.cubql_bvh.primitive_indices[prim_offset + i]);
-                const int i0 = mesh.indices[primitive_index * 3 + 0];
-                const int i1 = mesh.indices[primitive_index * 3 + 1];
-                const int i2 = mesh.indices[primitive_index * 3 + 2];
-
-                const vec3 p = mesh.points[i0];
-                const vec3 q = mesh.points[i1];
-                const vec3 r = mesh.points[i2];
-
+                const vec3 p = mesh.points[mesh.indices[primitive_index * 3 + 0]];
+                const vec3 q = mesh.points[mesh.indices[primitive_index * 3 + 1]];
+                const vec3 r = mesh.points[mesh.indices[primitive_index * 3 + 2]];
                 float tri_t, tri_u, tri_v, tri_sign;
                 vec3 tri_n;
                 if (intersect_ray_tri_woop(start, ray_dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &tri_n)) {
                     if (tri_t >= 0.0f && (Mode == CuBQLRayMode::CountAll || tri_t < prune_t)) {
                         if (Mode == CuBQLRayMode::ClosestHit) {
-                            prune_t = tri_t;
-                            hit_t = tri_t;
-                            hit_face = primitive_index;
-                            hit_u = tri_u;
-                            hit_v = tri_v;
-                            hit_sign = tri_sign;
+                            prune_t    = tri_t;
+                            hit_t      = tri_t;
+                            hit_face   = primitive_index;
+                            hit_u      = tri_u;
+                            hit_v      = tri_v;
+                            hit_sign   = tri_sign;
                             hit_normal = tri_n;
                         } else if (Mode == CuBQLRayMode::AnyHit) {
                             return 1;
@@ -1909,7 +1989,7 @@ CUDA_CALLABLE inline int cubql_ray_traversal(
             break;
         node_admin = stack[--stack_size];
     }
-
+#endif
     return result;
 }
 

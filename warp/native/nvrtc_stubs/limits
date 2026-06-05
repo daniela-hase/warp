@@ -1,0 +1,194 @@
+// NVRTC stub for <limits>.
+// Provides std::numeric_limits with explicit specializations using CUDA device
+// intrinsics (__int_as_float, __longlong_as_double) for floating-point constants.
+// Integer limits come from macros defined in nvrtc_stubs/limits.h.
+#pragma once
+#include <limits.h>
+
+namespace std {
+
+// Primary template — unspecialized types get sentinel "not-a-numeric-type" defaults.
+template<typename T>
+struct numeric_limits {
+    static const bool is_specialized = false;
+    static const bool is_integer     = false;
+    static const bool is_signed      = false;
+    static inline T min()      { return T(); }
+    static inline T max()      { return T(); }
+    static inline T lowest()   { return T(); }
+    static inline T infinity() { return T(); }
+    static inline T quiet_NaN(){ return T(); }
+    static inline T epsilon()  { return T(); }
+};
+
+template<>
+struct numeric_limits<float> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = false;
+    static const bool is_signed      = true;
+    // IEEE 754 bit patterns decoded via CUDA intrinsic (device-safe):
+    static inline float min()       { return __int_as_float(0x00800000); } // 1.175494e-38
+    static inline float max()       { return __int_as_float(0x7f7fffff); } // 3.402823e+38
+    static inline float lowest()    { return __int_as_float(0xff7fffff); } // -3.402823e+38
+    static inline float infinity()  { return __int_as_float(0x7f800000); }
+    static inline float quiet_NaN() { return __int_as_float(0x7fc00000); }
+    static inline float epsilon()   { return __int_as_float(0x34000000); } // 1.192093e-07
+};
+
+template<>
+struct numeric_limits<double> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = false;
+    static const bool is_signed      = true;
+    static inline double min()       { return __longlong_as_double(0x0010000000000000LL); }
+    static inline double max()       { return __longlong_as_double(0x7fefffffffffffffLL); }
+    static inline double lowest()    { return __longlong_as_double(0xffefffffffffffffLL); }
+    static inline double infinity()  { return __longlong_as_double(0x7ff0000000000000LL); }
+    static inline double quiet_NaN() { return __longlong_as_double(0x7ff8000000000000LL); }
+    static inline double epsilon()   { return __longlong_as_double(0x3cb0000000000000LL); }
+};
+
+template<>
+struct numeric_limits<int> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline int min()       { return INT_MIN; }
+    static inline int max()       { return INT_MAX; }
+    static inline int lowest()    { return INT_MIN; }
+    static inline int infinity()  { return 0; }
+    static inline int quiet_NaN() { return 0; }
+    static inline int epsilon()   { return 0; }
+};
+
+template<>
+struct numeric_limits<unsigned int> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = false;
+    static inline unsigned int min()       { return 0U; }
+    static inline unsigned int max()       { return UINT_MAX; }
+    static inline unsigned int lowest()    { return 0U; }
+    static inline unsigned int infinity()  { return 0U; }
+    static inline unsigned int quiet_NaN() { return 0U; }
+    static inline unsigned int epsilon()   { return 0U; }
+};
+
+template<>
+struct numeric_limits<long> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline long min()       { return LONG_MIN; }
+    static inline long max()       { return LONG_MAX; }
+    static inline long lowest()    { return LONG_MIN; }
+    static inline long infinity()  { return 0L; }
+    static inline long quiet_NaN() { return 0L; }
+    static inline long epsilon()   { return 0L; }
+};
+
+template<>
+struct numeric_limits<unsigned long> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = false;
+    static inline unsigned long min()       { return 0UL; }
+    static inline unsigned long max()       { return ULONG_MAX; }
+    static inline unsigned long lowest()    { return 0UL; }
+    static inline unsigned long infinity()  { return 0UL; }
+    static inline unsigned long quiet_NaN() { return 0UL; }
+    static inline unsigned long epsilon()   { return 0UL; }
+};
+
+template<>
+struct numeric_limits<long long> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline long long min()       { return LLONG_MIN; }
+    static inline long long max()       { return LLONG_MAX; }
+    static inline long long lowest()    { return LLONG_MIN; }
+    static inline long long infinity()  { return 0LL; }
+    static inline long long quiet_NaN() { return 0LL; }
+    static inline long long epsilon()   { return 0LL; }
+};
+
+template<>
+struct numeric_limits<unsigned long long> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = false;
+    static inline unsigned long long min()       { return 0ULL; }
+    static inline unsigned long long max()       { return ULLONG_MAX; }
+    static inline unsigned long long lowest()    { return 0ULL; }
+    static inline unsigned long long infinity()  { return 0ULL; }
+    static inline unsigned long long quiet_NaN() { return 0ULL; }
+    static inline unsigned long long epsilon()   { return 0ULL; }
+};
+
+template<>
+struct numeric_limits<short> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline short min()       { return SHRT_MIN; }
+    static inline short max()       { return SHRT_MAX; }
+    static inline short lowest()    { return SHRT_MIN; }
+    static inline short infinity()  { return 0; }
+    static inline short quiet_NaN() { return 0; }
+    static inline short epsilon()   { return 0; }
+};
+
+template<>
+struct numeric_limits<unsigned short> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = false;
+    static inline unsigned short min()       { return 0; }
+    static inline unsigned short max()       { return USHRT_MAX; }
+    static inline unsigned short lowest()    { return 0; }
+    static inline unsigned short infinity()  { return 0; }
+    static inline unsigned short quiet_NaN() { return 0; }
+    static inline unsigned short epsilon()   { return 0; }
+};
+
+template<>
+struct numeric_limits<char> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline char min()       { return CHAR_MIN; }
+    static inline char max()       { return CHAR_MAX; }
+    static inline char lowest()    { return CHAR_MIN; }
+    static inline char infinity()  { return 0; }
+    static inline char quiet_NaN() { return 0; }
+    static inline char epsilon()   { return 0; }
+};
+
+template<>
+struct numeric_limits<unsigned char> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = false;
+    static inline unsigned char min()       { return 0; }
+    static inline unsigned char max()       { return UCHAR_MAX; }
+    static inline unsigned char lowest()    { return 0; }
+    static inline unsigned char infinity()  { return 0; }
+    static inline unsigned char quiet_NaN() { return 0; }
+    static inline unsigned char epsilon()   { return 0; }
+};
+
+template<>
+struct numeric_limits<signed char> {
+    static const bool is_specialized = true;
+    static const bool is_integer     = true;
+    static const bool is_signed      = true;
+    static inline signed char min()       { return SCHAR_MIN; }
+    static inline signed char max()       { return SCHAR_MAX; }
+    static inline signed char lowest()    { return SCHAR_MIN; }
+    static inline signed char infinity()  { return 0; }
+    static inline signed char quiet_NaN() { return 0; }
+    static inline signed char epsilon()   { return 0; }
+};
+
+} // namespace std
