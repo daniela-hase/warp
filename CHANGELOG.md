@@ -153,7 +153,7 @@
   ([GH-1508](https://github.com/NVIDIA/warp/issues/1508)).
 - Improve `wp.mesh_query_ray()` and `wp.mesh_query_ray_anyhit()` BVH traversal performance
   by visiting the nearer child first at each inner node, enabling earlier tightening of the
-  closest-hit bound and more aggressive subtree pruning.
+  closest-hit bound and more aggressive subtree pruning. ([GH-1529](https://github.com/NVIDIA/warp/issues/1529))
 
 ### Fixed
 
@@ -240,7 +240,7 @@
 - Fix `wp.mesh_query_ray()` and related functions silently missing intersections for
   axis-aligned rays. A zero direction component caused `0 × ∞ = NaN` in the slab AABB
   test, which propagated through comparisons and wrongly rejected valid BVH nodes. The
-  per-traversal AABB epsilon inflation workaround (`eps = 1e-3`) is also removed.
+  per-traversal AABB epsilon inflation workaround (`eps = 1e-3`) is also removed. ([GH-1530](https://github.com/NVIDIA/warp/issues/1530))
 
 ### Documentation
 
