@@ -18,6 +18,7 @@ import re
 import textwrap
 import threading
 import types
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, get_args, get_origin
 
@@ -330,33 +331,25 @@ def _is_tid_call(node) -> bool:
 
 
 def iter_ast_nodes_of_types(root: ast.AST, *types: type):
-    """Yield only the AST nodes whose exact type is in ``types``, in depth-first search (DFS) order.
+    """Like ``(n for n in ast.walk(root) if type(n) in types)`` but faster.
 
-    Equivalent to ``(n for n in ast.walk(root) if type(n) in types)`` but
-    faster: ``ast.walk`` is a Python generator over ``iter_child_nodes``;
-    this version inlines the field iteration. Uses ``type(node) in types``
-    (exact-type match) rather than ``isinstance`` (subclass check), which is
-    safe because AST node classes are never subclassed in practice.
+    Inlines ``ast.walk``'s field iteration over a ``deque``, preserving its
+    breadth-first order, so it is a drop-in even where order matters. Exact-type
+    match; AST node classes are never subclassed in practice.
     """
-    if type(root) in types:
-        yield root
-    stack = [root]
-    while stack:
-        node = stack.pop()
+    todo = deque((root,))
+    while todo:
+        node = todo.popleft()
+        if type(node) in types:
+            yield node
         for field in node._fields:
             value = getattr(node, field, None)
-            if value is None:
-                continue
             if type(value) is list:
                 for child in value:
                     if isinstance(child, ast.AST):
-                        if type(child) in types:
-                            yield child
-                        stack.append(child)
+                        todo.append(child)
             elif isinstance(value, ast.AST):
-                if type(value) in types:
-                    yield value
-                stack.append(value)
+                todo.append(value)
 
 
 def _is_texture_type(var_type: type) -> bool:
@@ -1164,22 +1157,6 @@ class Adjoint:
         # so we only avoid rebuilding kernels that errored out to give a chance
         # for unit testing errors being spit out from kernels.
         adj.skip_build = False
-
-        # Infer kernel_dim before hashing because it selects the
-        # ``launch_bounds_t<N>`` type in generated C++.
-        adj.kernel_dim = adj._infer_kernel_dim()
-
-    def _infer_kernel_dim(adj) -> int:
-        max_dim = 0
-        for node in ast.walk(adj.tree):
-            if isinstance(node, ast.Assign) and _is_tid_call(node.value):
-                target = node.targets[0]
-                if isinstance(target, ast.Tuple):
-                    max_dim = max(max_dim, len(target.elts))
-                else:
-                    max_dim = max(max_dim, 1)
-
-        return max_dim if max_dim > 0 else 1
 
     # allocate extra space for a function call that requires its
     # own shared memory space, we treat shared memory as a stack
@@ -4694,15 +4671,23 @@ class Adjoint:
         return ast.get_source_segment(adj.source, node)
 
     def get_references(adj) -> tuple[dict[str, Any], dict[Any, Any], dict[warp._src.context.Function, Any]]:
-        """Traverses ``adj.tree`` and returns referenced constants, types, and user-defined functions."""
+        """Traverse ``adj.tree`` for referenced constants, types, and user-defined functions.
+
+        As a side effect, also sets ``adj.kernel_dim`` (the thread-grid dimension inferred from
+        ``wp.tid()``). It is folded into this traversal rather than walked separately because
+        ``get_references`` already visits every ``Assign`` and runs for every adjoint during
+        module hashing -- which precedes any code generation or launch that reads ``kernel_dim``.
+        """
 
         local_variables = set()  # Track local variables appearing on the LHS so we know when variables are shadowed
 
         constants: dict[str, Any] = {}
         types: dict[Struct | type, Any] = {}
         functions: dict[warp._src.context.Function, Any] = {}
+        max_dim = 0  # thread-grid dimension, inferred from wp.tid() unpack arity
 
-        for node in ast.walk(adj.tree):
+        # Faster, order-preserving drop-in for ast.walk; runs for every adjoint during hashing.
+        for node in iter_ast_nodes_of_types(adj.tree, ast.Name, ast.Attribute, ast.Call, ast.Assign):
             if isinstance(node, ast.Name) and node.id not in local_variables:
                 # look up in closure/global variables
                 obj = adj.resolve_external_reference(node.id)
@@ -4727,6 +4712,11 @@ class Adjoint:
                     types[func] = None
 
             elif isinstance(node, ast.Assign):
+                # Infer the thread-grid dimension from `i[, j, ...] = wp.tid()` unpack arity.
+                if _is_tid_call(node.value):
+                    target = node.targets[0]
+                    max_dim = max(max_dim, len(target.elts) if isinstance(target, ast.Tuple) else 1)
+
                 # A function bound to a local (`f = mod.func`) or to several locals via tuple
                 # unpacking (`f, g = mod.a, mod.b`) is referenced only through the local(s)
                 # afterwards, so it would otherwise be missed here and left out of the module
@@ -4746,6 +4736,7 @@ class Adjoint:
                 elif isinstance(lhs, ast.Name):
                     local_variables.add(lhs.id)
 
+        adj.kernel_dim = max_dim if max_dim > 0 else 1
         return constants, types, functions
 
 
