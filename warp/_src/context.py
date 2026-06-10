@@ -63,7 +63,7 @@ import warp
 import warp._src.build
 import warp._src.codegen
 import warp.config
-from warp._src.codegen import WarpCodegenTypeError, synchronized
+from warp._src.codegen import WarpCodegenTypeError, _codegen_lock, synchronized
 from warp._src.logger import LOG_DEBUG, LOG_WARNING, get_logger, log_debug, log_error, log_info, log_warning
 from warp._src.texture import Texture1D, Texture2D, Texture3D, texture1d_t, texture2d_t, texture3d_t
 from warp._src.types import LAUNCH_MAX_DIMS, Array, LaunchBounds, launch_bounds_t, type_repr
@@ -958,13 +958,17 @@ def func(
         :func:`warp.kernel` for defining kernels that can be launched on devices.
     """
 
+    frame = inspect.currentframe()
+    if frame is None or frame.f_back is None:
+        scope_locals = {}
+    else:
+        scope_locals = frame.f_back.f_locals
+
     def wrapper(f, *args, **kwargs):
         if name is None:
             key = warp._src.codegen.make_full_qualified_name(f)
         else:
             key = name
-
-        scope_locals = inspect.currentframe().f_back.f_back.f_locals
 
         if module is None:
             m = get_module(f.__module__)
@@ -999,8 +1003,97 @@ def func(
 
 
 def func_native(snippet: str, adj_snippet: str | None = None, replay_snippet: str | None = None):
-    """
-    Decorator to register native code snippet, @func_native
+    """Register a Warp function implemented by a native C++/CUDA snippet.
+
+    ``@wp.func_native`` is an escape hatch for operations that are easier to
+    express in native code than in Warp's kernel language, such as CUDA
+    intrinsics, shared-memory synchronization patterns, or small C++ helper
+    expressions. The decorated Python function is a typed stub: its argument
+    names become the variable names available inside the snippet, and its body
+    should be ``...``.
+
+    Args:
+        snippet: Native C++/CUDA code inserted into the generated forward
+            function body.
+        adj_snippet: Optional native code inserted into the generated adjoint
+            function body. Use ``adj_``-prefixed argument names, and ``adj_ret``
+            for the adjoint of a return value.
+        replay_snippet: Optional native code used when Warp replays the forward
+            function while executing the generated backward pass. Use this when
+            replaying ``snippet`` would repeat an unsafe side effect, such as
+            incrementing an atomic counter.
+
+    Returns:
+        A decorator that registers the typed stub as a Warp function.
+
+    Note:
+        Compute thread indices in the calling kernel or function and pass them
+        explicitly; snippets cannot call :func:`wp.tid() <warp.tid>`.
+        Pure C++ snippets can be used by CPU kernels, while CUDA-specific
+        constructs require CUDA kernels. If the snippet returns a value, the
+        Python stub must declare the return type. Struct return values are not
+        supported.
+
+    Example:
+        Insert a native element-wise operation:
+
+        .. code-block:: python
+
+            snippet = "out[tid] = x[tid] + 1.0f;"
+
+
+            @wp.func_native(snippet)
+            def increment(
+                x: wp.array[wp.float32],
+                out: wp.array[wp.float32],
+                tid: int,
+            ): ...
+
+
+            @wp.kernel
+            def kernel(x: wp.array[wp.float32], out: wp.array[wp.float32]):
+                tid = wp.tid()
+                increment(x, out, tid)
+
+        Use CUDA shared memory:
+
+        This pattern assumes the kernel is launched with ``block_dim=128``.
+
+        .. code-block:: python
+
+            snippet = '''
+                int local_tid = threadIdx.x;
+                __shared__ int values[128];
+                values[local_tid] = arr[tid];
+                __syncthreads();
+                out[tid] = values[127 - local_tid];
+                '''
+
+
+            @wp.func_native(snippet)
+            def reverse_block(arr: wp.array[int], out: wp.array[int], tid: int): ...
+
+        Provide an adjoint snippet for differentiability:
+
+        .. code-block:: python
+
+            snippet = "out[tid] = 2.0f * x[tid] + y[tid];"
+            adj_snippet = '''
+                adj_x[tid] += 2.0f * adj_out[tid];
+                adj_y[tid] += adj_out[tid];
+                '''
+
+
+            @wp.func_native(snippet=snippet, adj_snippet=adj_snippet)
+            def axpy(
+                x: wp.array[wp.float32],
+                y: wp.array[wp.float32],
+                out: wp.array[wp.float32],
+                tid: int,
+            ): ...
+
+    See Also:
+        :ref:`Native Snippets in Warp Kernels <native_functions>`
     """
 
     frame = inspect.currentframe()
@@ -1310,7 +1403,7 @@ def kernel(
 
 
         @wp.kernel(module_options={"fast_math": True}, module="unique")
-        def my_kernel_fast(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+        def my_kernel_fast(a: wp.array[float], b: wp.array[float]):
             # fast_math is a module-level option, so module="unique" is required
             tid = wp.tid()
             b[tid] = a[tid] + 1.0
@@ -2302,24 +2395,6 @@ class ModuleHasher:
         return self.unique_kernels.values()
 
 
-# Process-wide codegen lock. ``adj.build()`` mutates per-Adjoint state
-# (``adj.blocks``, ``adj.deferred_static_expressions``, etc.) on the
-# *same* Adjoint object whenever multiple modules reference a shared
-# ``@wp.func``. Holding this lock around the ``ModuleBuilder`` +
-# ``builder.codegen()`` window in :meth:`Module._compile` serialises
-# the Python-side codegen so concurrent ``Module.load`` calls (e.g.
-# from :func:`force_load` with ``max_workers > 1``) don't interleave
-# function emissions in the per-module .cu output. The expensive
-# nvrtc / nvcc invocation runs after the lock is released, so loading
-# N modules in parallel still parallelises the compiler step (the
-# dominant cost) -- only the much cheaper codegen serialises.
-#
-# Re-entrant so nested ``ModuleBuilder`` calls (e.g. the dummy build
-# inside :meth:`Module.get_module_hash`) on the same thread don't
-# deadlock.
-_codegen_lock = threading.RLock()
-
-
 class ModuleBuilder:
     def __init__(self, module, options, hasher=None):
         self.functions = {}
@@ -2755,7 +2830,7 @@ class Module:
 
         return options
 
-    @synchronized
+    @synchronized()
     def increment_id(self) -> int:
         self.cpu_exec_id += 1
         return self.cpu_exec_id
@@ -2876,9 +2951,10 @@ class Module:
                 self.references.add(ref)
                 ref.dependents.add(self)
 
-        # scan for function calls and kernel-local function bindings.
-        # ``iter_ast_nodes_of_types`` is a faster, order-preserving drop-in for ``ast.walk``.
-        for node in warp._src.codegen.iter_ast_nodes_of_types(adj.tree, ast.Call, ast.Assign):
+        # scan for function calls and kernel-local function bindings. ``reference_nodes`` shares
+        # a single AST traversal with Adjoint.get_references; it also yields Name/Attribute
+        # nodes, which this dependency scan ignores.
+        for node in adj.reference_nodes():
             if type(node) is ast.Call:
                 try:
                     # try to resolve the function
@@ -2894,12 +2970,7 @@ class Module:
                     # and that's ok too (not an external reference).
                     pass
 
-            else:
-                # ``iter_ast_nodes_of_types`` only yields ``ast.Call`` or ``ast.Assign`` per its
-                # type-filter argument above; this assertion documents that and guards
-                # against a future call-site change that adds a third type without
-                # updating this branch.
-                assert type(node) is ast.Assign
+            elif type(node) is ast.Assign:
                 # A function bound to a kernel-local (`f = mod.func`) or to several locals via
                 # tuple unpacking (`f, g = mod.a, mod.b`) is later called through the local(s),
                 # so the ast.Call above resolves to the local rather than to the function.
@@ -2921,6 +2992,7 @@ class Module:
             if isinstance(arg.type, warp._src.codegen.Struct) and arg.type.module is not None:
                 add_ref(arg.type.module)
 
+    @synchronized(_codegen_lock)
     def hash_module(self) -> bytes:
         """Get the hash of the module for the current block_dim.
 
@@ -2928,15 +3000,11 @@ class Module:
         """
         block_dim = self.options["block_dim"]
         options = self.resolve_options(warp.config)
-        # ``ModuleHasher.__init__`` calls ``hash_kernel`` -> ``hash_adjoint``
-        # which reads shared ``@wp.func`` adjoint state; serialise with
-        # ``_codegen_lock`` so concurrent ``Module.load`` callers don't
-        # interleave hash + build mutations on the same Adjoint.
-        with _codegen_lock:
-            self.hashers[block_dim] = ModuleHasher(self._get_live_kernels(), options)
+        self.hashers[block_dim] = ModuleHasher(self._get_live_kernels(), options)
         self.resolved_options[block_dim] = options
         return self.hashers[block_dim].get_hash()
 
+    @synchronized(_codegen_lock)
     def get_module_hash(self, block_dim: int | None = None) -> bytes:
         """Get the hash of the module for a block_dim variant.
 
@@ -2946,27 +3014,16 @@ class Module:
         if block_dim is None:
             block_dim = self.options["block_dim"]
 
-        # Both branches below mutate shared ``@wp.func`` adjoint state
-        # (``ModuleBuilder`` runs ``adj.build`` to resolve deferred
-        # ``wp.static`` expressions; ``ModuleHasher`` reads the
-        # resulting adjoint blocks via ``hash_adjoint``). The two
-        # operations are stages of one logical "compute module hash"
-        # critical section, so they live in a single ``_codegen_lock``
-        # block. Splitting the lock per stage opens a window where
-        # another thread can re-run ``adj.build`` on a shared helper
-        # and clobber the state this thread is about to hash.
-        if self.has_unresolved_static_expressions or block_dim not in self.hashers:
-            with _codegen_lock:
-                if self.has_unresolved_static_expressions:
-                    options = self.resolve_options(warp.config)
-                    builder_options = options | {"output_arch": None}
-                    _ = ModuleBuilder(self, builder_options)
-                    self.has_unresolved_static_expressions = False
+        if self.has_unresolved_static_expressions:
+            options = self.resolve_options(warp.config, block_dim=block_dim)
+            builder_options = options | {"output_arch": None, "block_dim": block_dim}
+            _ = ModuleBuilder(self, builder_options)
+            self.has_unresolved_static_expressions = False
 
-                if block_dim not in self.hashers:
-                    options = self.resolve_options(warp.config, block_dim=block_dim)
-                    self.hashers[block_dim] = ModuleHasher(self._get_live_kernels(), options)
-                    self.resolved_options[block_dim] = options
+        if block_dim not in self.hashers:
+            options = self.resolve_options(warp.config, block_dim=block_dim)
+            self.hashers[block_dim] = ModuleHasher(self._get_live_kernels(), options)
+            self.resolved_options[block_dim] = options
 
         return self.hashers[block_dim].get_hash()
 
@@ -3065,6 +3122,34 @@ class Module:
         """
         return f"{self.get_module_identifier(block_dim=block_dim)}.meta"
 
+    @synchronized(_codegen_lock)
+    def _run_codegen(self, options: dict, is_cpu: bool) -> tuple[str, str, dict, list, list]:
+        """Run the Python-side codegen window.
+
+        Returns ``(source, ext, meta, ltoirs, fatbins)``: the emitted C++/CUDA
+        source, its file extension, the metadata dict, and snapshots of the
+        builder's LTO-IR and fatbin collections.
+
+        Held under ``_codegen_lock`` so concurrent ``Module._compile`` callers
+        cannot interleave ``adj.build`` writes and ``codegen()`` reads on a
+        shared ``@wp.func``'s Adjoint state. The expensive NVRTC / NVCC /
+        Clang invocation runs after this returns, so N modules still compile
+        in parallel -- only the cheap codegen window serialises.
+        """
+        builder = ModuleBuilder(
+            self,
+            options,
+            hasher=self.hashers.get(options["block_dim"], None),
+        )
+        if is_cpu:
+            ext = "cpp"
+            source = builder.codegen("cpu")
+        else:
+            ext = "cu"
+            source = builder.codegen("cuda")
+        meta = builder.build_meta()
+        return source, ext, meta, list(builder.ltoirs.values()), list(builder.fatbins.values())
+
     def _compile(
         self,
         device: Device | None = None,
@@ -3146,6 +3231,20 @@ class Module:
         ):
             return False
 
+        # Python codegen window -- runs serialised under ``_codegen_lock``
+        # inside ``_run_codegen``. Snapshots all builder state needed by
+        # the native compile below, so the native step (the dominant cost)
+        # runs unlocked and parallelises across N modules.
+        #
+        # NOTE: ``_run_codegen`` is intentionally outside the
+        # ``failed_builds`` try/except below. ``ModuleBuilder`` can
+        # legitimately raise from ``adj.build`` (e.g. user kernels with
+        # type mismatches in the error tests); if we recorded those in
+        # ``failed_builds`` the next ``Module.load`` on the same device
+        # short-circuits with ``return None`` and subsequent unrelated
+        # kernels in the same module silently fail to launch.
+        source_str, source_code_ext, meta, ltoir_values, fatbin_values = self._run_codegen(options, is_cpu)
+
         meta_path = os.path.join(output_dir, self._get_meta_name(block_dim=active_block_dim))
 
         build_dir = os.path.normpath(output_dir) + f"_p{os.getpid()}_t{threading.get_ident()}"
@@ -3162,39 +3261,7 @@ class Module:
         if opt != 3 and not is_cpu and runtime.toolkit_version is not None and runtime.toolkit_version < (12, 9):
             log_warning("Optimization level other than 3 has no effect on CUDA versions prior to 12.9.", once=True)
 
-        # Python codegen window -- LOCKED. See ``_codegen_lock``.
-        # Some of the tile codegen, such as cuFFTDx and cuBLASDx,
-        # requires knowledge of the target arch. Snapshot builder
-        # collections needed by ``build_cuda`` below into locals so
-        # nothing inside the lock is touched after release.
-        #
-        # NOTE: this lock window is intentionally outside the
-        # ``failed_builds`` try/except below. ``ModuleBuilder`` can
-        # legitimately raise from ``adj.build`` (e.g. user kernels
-        # with type mismatches in the type-mismatch error tests); if
-        # we recorded those in ``failed_builds`` the next ``Module.load``
-        # on the same device short-circuits with ``return None`` and
-        # subsequent unrelated kernels in the same module silently
-        # fail to launch. Only the heavy native compile records
-        # ``failed_builds``.
-        with _codegen_lock:
-            builder = ModuleBuilder(
-                self,
-                options,
-                hasher=self.hashers.get(options["block_dim"], None),
-            )
-            if is_cpu:
-                source_code_ext = "cpp"
-                source_str = builder.codegen("cpu")
-            else:
-                source_code_ext = "cu"
-                source_str = builder.codegen("cuda")
-            meta = builder.build_meta()
-            ltoir_values = list(builder.ltoirs.values())
-            fatbin_values = list(builder.fatbins.values())
-
         source_code_path = os.path.join(build_dir, f"{module_name_short}.{source_code_ext}")
-
         with open(source_code_path, "w") as source_file:
             source_file.write(source_str)
 
@@ -3258,7 +3325,7 @@ class Module:
             raise (e)
 
         # ------------------------------------------------------------
-        # write meta data (already produced under ``_codegen_lock``)
+        # write meta data (already produced by ``_run_codegen`` above)
 
         output_meta_path = os.path.join(build_dir, self._get_meta_name(block_dim=active_block_dim))
 
@@ -5201,10 +5268,39 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.wp_array_scan_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
+            self.core.wp_array_scan_int_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_int64_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
             self.core.wp_array_scan_float_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_double_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_bool,
             ]
@@ -5212,23 +5308,140 @@ class Runtime:
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_int64_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_bool,
             ]
             self.core.wp_array_scan_float_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_double_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_bool,
             ]
 
-            self.core.wp_radix_sort_pairs_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.wp_radix_sort_pairs_int_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_int_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_int_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
-            self.core.wp_radix_sort_pairs_float_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.wp_radix_sort_pairs_float_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_uint_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_uint_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
-            self.core.wp_radix_sort_pairs_int64_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.wp_radix_sort_pairs_int64_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_float_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_float_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_radix_sort_pairs_double_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_double_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_radix_sort_pairs_int64_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_int64_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_radix_sort_pairs_uint64_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_radix_sort_pairs_uint64_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
             self.core.wp_segmented_sort_pairs_int_host.argtypes = [
                 ctypes.c_uint64,
@@ -5488,21 +5701,33 @@ class Runtime:
                 ctypes.c_int,  # num_channels
                 ctypes.c_int,  # dtype
                 ctypes.c_bool,  # surface_access
+                ctypes.c_int,  # num_mip_levels
             ]
             self.core.wp_texture_create_device.restype = ctypes.c_uint64
 
-            self.core.wp_texture_destroy_device.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            self.core.wp_texture_destroy_device.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_bool]
             self.core.wp_texture_destroy_device.restype = None
+
+            self.core.wp_texture_get_mip_level_array_device.argtypes = [
+                ctypes.c_void_p,  # context
+                ctypes.c_uint64,  # mipmap_array_handle
+                ctypes.c_int,  # level
+            ]
+            self.core.wp_texture_get_mip_level_array_device.restype = ctypes.c_uint64
 
             self.core.wp_texture_create_host.argtypes = [
                 ctypes.c_int,  # ndim
-                ctypes.POINTER(ctypes.c_int),  # shape [ndim]
+                ctypes.c_int,  # num_mip_levels
+                ctypes.POINTER(ctypes.c_int),  # mip_widths
+                ctypes.POINTER(ctypes.c_int),  # mip_heights
+                ctypes.POINTER(ctypes.c_int),  # mip_depths
                 ctypes.c_int,  # num_channels
                 ctypes.c_int,  # dtype
-                ctypes.c_int,  # filter mode
+                ctypes.c_int,  # filter_mode
+                ctypes.c_int,  # mip_filter_mode
                 ctypes.POINTER(ctypes.c_int),  # address_modes [ndim]
                 ctypes.c_bool,  # use_normalized_coords
-                ctypes.c_void_p,  # data_ptr_out
+                ctypes.POINTER(ctypes.c_void_p),  # mip_data_ptrs_out (void**)
             ]
             self.core.wp_texture_create_host.restype = ctypes.c_uint64
 
@@ -5514,8 +5739,10 @@ class Runtime:
                 ctypes.c_uint64,  # array_handle
                 ctypes.c_int,  # ndim
                 ctypes.c_int,  # filter_mode
+                ctypes.c_int,  # mip_filter_mode
                 ctypes.POINTER(ctypes.c_int),  # address_modes [ndim]
                 ctypes.c_bool,  # use_normalized_coords
+                ctypes.c_int,  # num_mip_levels
             ]
             self.core.wp_texture_object_create_device.restype = ctypes.c_uint64
 
@@ -5564,10 +5791,11 @@ class Runtime:
                 ctypes.c_void_p,  # tpl_values
                 ctypes.c_uint64,  # zero_value_mask
                 ctypes.c_bool,  # masked
-                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
-                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # prefix sum of block count to sum for each bsr block
                 ctypes.POINTER(ctypes.c_int),  # indices to ptriplet blocks to sum for each bsr block
+                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # bsr_row_counts
+                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # bsr_nnz
                 ctypes.c_void_p,  # bsr_nnz_event
             ]
@@ -5579,14 +5807,37 @@ class Runtime:
                 ctypes.c_int,  # row_count
                 ctypes.c_int,  # col count
                 ctypes.c_int,  # nnz
+                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # bsr_row_counts
+                ctypes.POINTER(ctypes.c_int),  # bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
-                ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
-                ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # transposed_bsr_row_counts
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
                 ctypes.POINTER(ctypes.c_int),  # src to dest block map
+                ctypes.POINTER(ctypes.c_int),  # status
             ]
             self.core.wp_bsr_transpose_host.argtypes = bsr_transpose_argtypes
             self.core.wp_bsr_transpose_device.argtypes = bsr_transpose_argtypes
+
+            bsr_compress_inplace_argtypes = [
+                ctypes.c_int,  # row_count
+                ctypes.c_int,  # block_size
+                ctypes.c_int,  # scalar size in bytes
+                ctypes.c_int,  # scalar type code
+                ctypes.c_int,  # nnz_upper_bound
+                ctypes.c_bool,  # prune_numerical_zeros
+                ctypes.c_uint64,  # zero_value_mask
+                ctypes.c_bool,  # make_compact
+                ctypes.POINTER(ctypes.c_int),  # bsr_offsets
+                ctypes.POINTER(ctypes.c_int),  # bsr_row_counts
+                ctypes.POINTER(ctypes.c_int),  # bsr_columns
+                ctypes.c_void_p,  # bsr_values
+                ctypes.c_bool,  # compress_values
+                ctypes.POINTER(ctypes.c_int),  # bsr_nnz
+                ctypes.c_void_p,  # bsr_nnz_event
+            ]
+            self.core.wp_bsr_compress_inplace_host.argtypes = bsr_compress_inplace_argtypes
+            self.core.wp_bsr_compress_inplace_device.argtypes = bsr_compress_inplace_argtypes
 
             self.core.wp_is_cuda_enabled.argtypes = None
             self.core.wp_is_cuda_enabled.restype = ctypes.c_int
@@ -8477,6 +8728,11 @@ def invoke(kernel, hooks, params: Sequence[Any], adjoint: bool):
         hooks.backward(ctypes.byref(params[0]), ctypes.byref(args), ctypes.byref(adj_args))
 
 
+def _raise_cuda_launch_error(kernel: Kernel, device: Device) -> None:
+    """Raise a RuntimeError for the current CUDA launch failure."""
+    raise RuntimeError(f"Error launching kernel: {kernel.key} on device {device}: {runtime.get_error_string()}")
+
+
 class Launch:
     """Represent all data required for a kernel launch so that launches can be replayed quickly.
 
@@ -8683,7 +8939,7 @@ class Launch:
                     graph._retain_module_exec(self.module_exec)
 
             if self.adjoint:
-                runtime.core.wp_cuda_launch_kernel(
+                if runtime.core.wp_cuda_launch_kernel(
                     self.device.context,
                     self.hooks.backward,
                     self.bounds.size,
@@ -8693,9 +8949,10 @@ class Launch:
                     self.params_addr,
                     stream.cuda_stream,
                     None,  # apic_info: replayed launches don't re-record
-                )
+                ):
+                    _raise_cuda_launch_error(self.kernel, self.device)
             else:
-                runtime.core.wp_cuda_launch_kernel(
+                if runtime.core.wp_cuda_launch_kernel(
                     self.device.context,
                     self.hooks.forward,
                     self.bounds.size,
@@ -8705,7 +8962,8 @@ class Launch:
                     self.params_addr,
                     stream.cuda_stream,
                     None,  # apic_info: replayed launches don't re-record
-                )
+                ):
+                    _raise_cuda_launch_error(self.kernel, self.device)
 
 
 def _canonicalize_dim(dim: int | Sequence[int]) -> tuple[int, ...]:
@@ -9024,7 +9282,7 @@ def launch(
                             "Backward kernel launches are not supported during APIC graph capture. "
                             "Use wp.Tape outside of capture scope instead."
                         )
-                    runtime.core.wp_cuda_launch_kernel(
+                    if runtime.core.wp_cuda_launch_kernel(
                         device.context,
                         hooks.backward,
                         bounds.size,
@@ -9034,7 +9292,8 @@ def launch(
                         kernel_params,
                         stream.cuda_stream,
                         None,
-                    )
+                    ):
+                        _raise_cuda_launch_error(kernel, device)
 
             else:
                 if hooks.forward is None:
@@ -9067,7 +9326,7 @@ def launch(
                             False,
                         )
                         apic_info_ptr = ctypes.byref(apic_info)
-                    runtime.core.wp_cuda_launch_kernel(
+                    if runtime.core.wp_cuda_launch_kernel(
                         device.context,
                         hooks.forward,
                         bounds.size,
@@ -9077,7 +9336,8 @@ def launch(
                         kernel_params,
                         stream.cuda_stream,
                         apic_info_ptr,
-                    )
+                    ):
+                        _raise_cuda_launch_error(kernel, device)
 
             try:
                 runtime.verify_cuda_device(device)
