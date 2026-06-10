@@ -42,7 +42,7 @@ namespace wp {
 struct alignas(16) CubqlNode {
     vec3 lower;
     vec3 upper;
-    uint64_t admin;
+    uint64_t admin = 0;
 };
 
 __global__ void cubql_make_boxes(const vec3* lowers, const vec3* uppers, cuBQL::box3f* boxes, int n)
