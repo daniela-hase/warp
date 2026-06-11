@@ -391,6 +391,13 @@ static bool cubql_copy_to_native_host_bvh(BVH& bvh, const cuBQL::bvh3f& native)
     bvh.primitive_indices
         = static_cast<int*>(wp_alloc_host(sizeof(int) * build.primitive_indices.size(), "(native:bvh)"));
     bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+
+    if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices || !bvh.root) {
+        wp::set_error_string("Warp error: failed to allocate native BVH storage for cuBQL conversion");
+        bvh_destroy_host(bvh);
+        return false;
+    }
+
     bvh.root[0] = root;
 
     std::copy(build.node_lowers.begin(), build.node_lowers.end(), bvh.node_lowers);
