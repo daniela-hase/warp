@@ -581,6 +581,7 @@ void cubql_bvh_create_device(
     cuBQL::box3f* boxes = reinterpret_cast<cuBQL::box3f*>(
         wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(cuBQL::box3f) * num_items, "(native:bvh)")
     );
+    cudaStream_t current_stream = static_cast<cudaStream_t>(wp_cuda_stream_get_current());
     wp_launch_device(WP_CURRENT_CONTEXT, cubql_make_boxes, num_items, (lowers, uppers, boxes, num_items));
 
     auto free_partial_bvh = [&]() { wp::bvh_destroy_device(bvh_device_on_host); };
@@ -590,7 +591,7 @@ void cubql_bvh_create_device(
         cuBQL::BuildConfig build_config;
         build_config.enableSAH();
         build_config.makeLeafThreshold = leaf_size;
-        cuBQL::gpuBuilder(native, boxes, uint32_t(num_items), build_config, 0, cubql_get_mem_resource());
+        cuBQL::gpuBuilder(native, boxes, uint32_t(num_items), build_config, current_stream, cubql_get_mem_resource());
         if (!cubql_copy_to_native_device(bvh_device_on_host, native)) {
             free_partial_bvh();
         }
@@ -604,7 +605,7 @@ void cubql_bvh_create_device(
 
     if (native.nodes || native.primIDs) {
         try {
-            cuBQL::cuda::free(native, 0, cubql_get_mem_resource());
+            cuBQL::cuda::free(native, current_stream, cubql_get_mem_resource());
         } catch (const std::exception& e) {
             wp::set_error_string("Warp error: cuBQL BVH free failed: %s", e.what());
             free_partial_bvh();
