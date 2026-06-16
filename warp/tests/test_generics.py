@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import types
 import unittest
 from typing import Any
 
@@ -318,6 +319,42 @@ def test_generic_transform_kernel(test, device):
         wp.synchronize()
 
 
+def test_nested_overload_stub(test, device):
+    @wp.kernel
+    def nested_overload_stub_kernel(x: Any):
+        return
+
+    @wp.overload
+    def nested_overload_stub_kernel(x: float): ...
+
+    test.assertEqual(len(nested_overload_stub_kernel.overloads), 1)
+
+
+@wp.kernel
+def overload_stub_return_annotation_kernel(x: Any):
+    return
+
+
+def overload_stub_return_annotation_kernel(x: float) -> float: ...
+
+
+def test_overload_stub_return_annotation(test, device):
+    with test.assertRaisesRegex(TypeError, r"Return annotations are not allowed on @wp\.overload stubs"):
+        wp.overload(overload_stub_return_annotation_kernel)
+
+
+@wp.kernel
+def overload_stub_nonetype_return_annotation_kernel(x: Any):
+    return
+
+
+def overload_stub_nonetype_return_annotation_kernel(x: float) -> types.NoneType: ...
+
+
+def test_overload_stub_nonetype_return_annotation(test, device):
+    wp.overload(overload_stub_nonetype_return_annotation_kernel)
+
+
 @wp.kernel
 def generic_transform_array(v: wp.array(), m: wp.array(), result: wp.array()):
     tid = wp.tid()
@@ -584,6 +621,16 @@ add_function_test(TestGenerics, "test_generic_fill", test_generic_fill, devices=
 add_function_test(TestGenerics, "test_generic_fill_overloads", test_generic_fill_overloads, devices=devices)
 add_function_test(TestGenerics, "test_generic_conditional_setter", test_generic_conditional_setter, devices=devices)
 add_function_test(TestGenerics, "test_generic_transform_kernel", test_generic_transform_kernel, devices=devices)
+add_function_test(TestGenerics, "test_nested_overload_stub", test_nested_overload_stub, devices=devices)
+add_function_test(
+    TestGenerics, "test_overload_stub_return_annotation", test_overload_stub_return_annotation, devices=devices
+)
+add_function_test(
+    TestGenerics,
+    "test_overload_stub_nonetype_return_annotation",
+    test_overload_stub_nonetype_return_annotation,
+    devices=devices,
+)
 add_function_test(
     TestGenerics, "test_generic_transform_array_kernel", test_generic_transform_array_kernel, devices=devices
 )

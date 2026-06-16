@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import threading
 import types
 import weakref
@@ -69,6 +70,11 @@ from warp._src.texture import Texture1D, Texture2D, Texture3D, texture1d_t, text
 from warp._src.types import LAUNCH_MAX_DIMS, Array, LaunchBounds, launch_bounds_t, type_repr
 
 _wp_module_name_ = "warp.context"
+
+_KERNEL_RETURN_ERROR = (
+    "Warp kernels cannot return values. Write results to output arguments, "
+    "and omit the return annotation or use `-> None`."
+)
 
 warp_home = os.path.realpath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -810,6 +816,9 @@ class Kernel:
             code_transformers = []
 
         self.adj = warp._src.codegen.Adjoint(func, transformers=code_transformers, source=source)
+        self.return_annotation = self.adj.arg_types.pop("return", None)
+        if self.return_annotation is types.NoneType:
+            self.return_annotation = None
 
         # check if generic
         self.is_generic = False
@@ -1524,6 +1533,7 @@ def kernel(
                 ch.update(module_hash)
                 ch.update(bytes(k.key, "utf-8"))
                 ch.update(hasher.hash_adjoint(k.adj))
+                ch.update(hasher._hash_kernel_return_annotation(k))
                 module_hash = ch.digest()
 
             # module_hash may have been salted above for generic kernels with
@@ -1669,7 +1679,7 @@ def overload(kernel: Kernel | Callable, arg_types: dict[str, Any] | list[Any] | 
 
         # ensure the function is defined without a body, only ellipsis (...), pass, or a string expression
         # TODO: show we allow defining a new body for kernel overloads?
-        source = inspect.getsource(fn)
+        source = textwrap.dedent(inspect.getsource(fn))
         tree = ast.parse(source)
         assert isinstance(tree, ast.Module)
         assert isinstance(tree.body[0], ast.FunctionDef)
@@ -1696,7 +1706,13 @@ def overload(kernel: Kernel | Callable, arg_types: dict[str, Any] | list[Any] | 
         # get type annotation list
         arg_list = []
         for arg_name, arg_type in argspec.annotations.items():
-            if arg_name != "return":
+            if arg_name == "return":
+                if arg_type is not None and arg_type is not types.NoneType:
+                    raise TypeError(
+                        "Return annotations are not allowed on @wp.overload stubs; "
+                        "omit the return annotation or use `-> None`."
+                    )
+            else:
                 arg_list.append(arg_type)
 
         # add new overload, but we must return the original kernel from @wp.overload decorator!
@@ -2260,12 +2276,28 @@ class ModuleHasher:
 
         ch.update(bytes(kernel.key, "utf-8"))
         ch.update(self.hash_adjoint(kernel.adj))
+        ch.update(self._hash_kernel_return_annotation(kernel))
 
         h = ch.digest()
 
         self.unique_kernels[h] = kernel
 
         return h
+
+    @staticmethod
+    def _hash_kernel_return_annotation(kernel: Kernel) -> bytes:
+        # Kernels still cannot return values. Hash non-None return annotations
+        # so an aliased invalid annotation cannot reuse a valid unique-module
+        # kernel before build-time validation rejects it.
+        if kernel.return_annotation is None:
+            return b""
+
+        try:
+            annotation = warp._src.types.get_type_code(kernel.return_annotation)
+        except TypeError:
+            annotation = repr(kernel.return_annotation)
+
+        return bytes(f"return:{annotation}", "utf-8")
 
     def hash_function(self, func: Function) -> bytes:
         # NOTE: This method hashes all possible overloads that a function call could resolve to.
@@ -2441,14 +2473,38 @@ class ModuleBuilder:
     def build_struct(self, struct):
         self.structs[struct] = None
 
+    @staticmethod
+    def _kernel_has_invalid_return_annotation(kernel):
+        return kernel.return_annotation is not None
+
+    @staticmethod
+    def _kernel_has_value_return(kernel):
+        func_def = kernel.adj.tree.body[0]
+        stack = list(func_def.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Return):
+                if node.value is not None:
+                    return True
+                continue
+            elif isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+
+            stack.extend(ast.iter_child_nodes(node))
+
+        return False
+
     def build_kernel(self, kernel):
         if kernel.options.get("enable_backward", True):
             kernel.adj.used_by_backward_kernel = True
 
+        if self._kernel_has_invalid_return_annotation(kernel) or self._kernel_has_value_return(kernel):
+            raise WarpCodegenTypeError(f"'{kernel.key}': {_KERNEL_RETURN_ERROR}")
+
         kernel.adj.build(self)
 
         if kernel.adj.return_var is not None:
-            raise WarpCodegenTypeError(f"'{kernel.key}': Error, kernels can't have return values")
+            raise WarpCodegenTypeError(f"'{kernel.key}': {_KERNEL_RETURN_ERROR}")
 
     def build_function(self, func):
         if func in self.functions:
@@ -11150,6 +11206,10 @@ def copy(
     (2) Otherwise, if the source array is on a CUDA device, use the current stream on the source device.
 
     If neither source nor destination are on a CUDA device, no stream is used for the copy.
+
+    When the source or destination is non-contiguous (e.g. a strided slice), ``dest_offset``, ``src_offset``, and
+    ``count`` are only supported for one-dimensional arrays; using them with multi-dimensional non-contiguous,
+    indexed, or Fabric arrays raises an error.
     """
     from warp._src.context import runtime  # noqa: PLC0415
 
@@ -11274,28 +11334,60 @@ def copy(
     else:
         # handle non-contiguous arrays
 
-        if src.shape != dest.shape:
+        # Apply the element offsets and count by slicing into strided views.  The
+        # contiguous path above handles them via flat pointer arithmetic, but the
+        # native non-contiguous copy walks the full array shape and would
+        # otherwise ignore them.  The test below is True whenever the copy does
+        # not span the full extent of *both* arrays (note count has been
+        # defaulted to src.size above); a full-array copy of equally-shaped arrays
+        # leaves the historical behavior (and the gradient recursion) unchanged.
+        src_nc = src
+        dest_nc = dest
+        if src_offset != 0 or dest_offset != 0 or count != src.size or count != dest.size:
+            if not isinstance(src, warp.array) or not isinstance(dest, warp.array):
+                raise RuntimeError(
+                    "dest_offset, src_offset, and count are not supported when copying to/from "
+                    "non-contiguous indexed or Fabric arrays"
+                )
+            if src.ndim != 1 or dest.ndim != 1:
+                raise RuntimeError(
+                    "dest_offset, src_offset, and count are only supported for 1-D non-contiguous arrays"
+                )
+            if src_offset < 0 or count < 0 or src_offset + count > src.size:
+                raise RuntimeError(
+                    f"Trying to copy a range of {count} element(s) from source offset ({src_offset}) "
+                    f"exceeds the source size ({src.size})"
+                )
+            if dest_offset < 0 or dest_offset + count > dest.size:
+                raise RuntimeError(
+                    f"Trying to copy a range of {count} element(s) to destination offset ({dest_offset}) "
+                    f"exceeds the destination size ({dest.size})"
+                )
+            src_nc = src[src_offset : src_offset + count]
+            dest_nc = dest[dest_offset : dest_offset + count]
+
+        if src_nc.shape != dest_nc.shape:
             raise RuntimeError("Incompatible array shapes")
 
-        src_elem_size = warp._src.types.type_size_in_bytes(src.dtype)
-        dst_elem_size = warp._src.types.type_size_in_bytes(dest.dtype)
+        src_elem_size = warp._src.types.type_size_in_bytes(src_nc.dtype)
+        dst_elem_size = warp._src.types.type_size_in_bytes(dest_nc.dtype)
 
         if src_elem_size != dst_elem_size:
             raise RuntimeError("Incompatible array data types")
 
         # can't copy to/from fabric arrays of arrays, because they are jagged arrays of arbitrary lengths
         # TODO?
-        if (isinstance(src, (warp.fabricarray, warp.indexedfabricarray)) and src.ndim > 1) or (
-            isinstance(dest, (warp.fabricarray, warp.indexedfabricarray)) and dest.ndim > 1
+        if (isinstance(src_nc, (warp.fabricarray, warp.indexedfabricarray)) and src_nc.ndim > 1) or (
+            isinstance(dest_nc, (warp.fabricarray, warp.indexedfabricarray)) and dest_nc.ndim > 1
         ):
             raise RuntimeError("Copying to/from Fabric arrays of arrays is not supported")
 
-        src_desc = src.__ctype__()
-        dst_desc = dest.__ctype__()
+        src_desc = src_nc.__ctype__()
+        dst_desc = dest_nc.__ctype__()
         src_ptr = ctypes.pointer(src_desc)
         dst_ptr = ctypes.pointer(dst_desc)
-        src_type = warp._src.types.array_type_id(src)
-        dst_type = warp._src.types.array_type_id(dest)
+        src_type = warp._src.types.array_type_id(src_nc)
+        dst_type = warp._src.types.array_type_id(dest_nc)
 
         if dest.device.is_cuda:
             # This work involves a kernel launch, so it must run on the destination device.
@@ -11342,7 +11434,11 @@ def adj_copy(
         adj_src: Source array adjoint
         stream: The stream on which the copy was performed in the forward pass
     """
-    copy(adj_src, adj_dest, dest_offset=dest_offset, src_offset=src_offset, count=count, stream=stream)
+    # The forward copy writes dest[dest_offset:...] = src[src_offset:...], so the
+    # adjoint propagates adj_src[src_offset:...] = adj_dest[dest_offset:...].  The
+    # offsets must therefore be swapped relative to the forward call: reading from
+    # adj_dest uses dest_offset and writing to adj_src uses src_offset.
+    copy(adj_src, adj_dest, dest_offset=src_offset, src_offset=dest_offset, count=count, stream=stream)
 
 
 def type_str(t):
