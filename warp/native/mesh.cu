@@ -403,7 +403,10 @@ int wp_mesh_refit_device(uint64_t id)
 
 #ifndef WP_DISABLE_CUBQL
         if (m.bvh_backend == wp::MESH_BVH_BACKEND_CUBQL) {
-            if (!wp::cubql_bvh_refit_device(m.cubql_bvh)) {
+            const bool success = wp::cubql_bvh_refit_device(m.cubql_bvh);
+            wp_memcpy_h2d(WP_CURRENT_CONTEXT, &(((wp::Mesh*)id)->cubql_bvh), &m.cubql_bvh, sizeof(wp::CuBQLBVH));
+            mesh_set_descriptor(id, m);
+            if (!success) {
                 return 0;
             }
         } else

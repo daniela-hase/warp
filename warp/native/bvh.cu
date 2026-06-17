@@ -786,6 +786,11 @@ void bvh_rebuild_device(BVH& bvh)
 
 #ifndef WP_DISABLE_CUBQL
 
+using CuBQLNativeBVH = cuBQL::WideBVH<float, 3, CUBQL_WIDE_BVH_WIDTH>;
+
+static_assert(sizeof(CuBQLNode) == sizeof(CuBQLNativeBVH::node_t), "CuBQL wide node layout mismatch");
+static_assert(alignof(CuBQLNode) == alignof(CuBQLNativeBVH::node_t), "CuBQL wide node alignment mismatch");
+
 __global__ void cubql_make_boxes(const vec3* lowers, const vec3* uppers, cuBQL::box3f* boxes, int n)
 {
     const int tid = blockDim.x * blockIdx.x + threadIdx.x;
@@ -797,17 +802,17 @@ __global__ void cubql_make_boxes(const vec3* lowers, const vec3* uppers, cuBQL::
     }
 }
 
-static inline cuBQL::bvh3f cubql_native_view(const CuBQLBVH& bvh)
+static inline CuBQLNativeBVH cubql_native_view(const CuBQLBVH& bvh)
 {
-    cuBQL::bvh3f native;
-    native.nodes = reinterpret_cast<cuBQL::bvh3f::node_t*>(bvh.nodes);
+    CuBQLNativeBVH native;
+    native.nodes = reinterpret_cast<CuBQLNativeBVH::node_t*>(bvh.nodes);
     native.numNodes = uint32_t(bvh.num_nodes);
     native.primIDs = reinterpret_cast<uint32_t*>(bvh.primitive_indices);
     native.numPrims = uint32_t(bvh.num_prims);
     return native;
 }
 
-static inline void cubql_assign(CuBQLBVH& bvh, const cuBQL::bvh3f& native)
+static inline void cubql_assign(CuBQLBVH& bvh, const CuBQLNativeBVH& native)
 {
     bvh.nodes = reinterpret_cast<CuBQLNode*>(native.nodes);
     bvh.num_nodes = int(native.numNodes);
@@ -875,7 +880,7 @@ void cubql_bvh_create_device(
     };
 
     try {
-        cuBQL::bvh3f native;
+        CuBQLNativeBVH native;
         cuBQL::BuildConfig build_config;
         build_config.enableSAH();
         build_config.makeLeafThreshold = leaf_size;
@@ -898,7 +903,7 @@ void cubql_bvh_destroy_device(CuBQLBVH& bvh)
     ContextGuard guard(bvh.context);
 
     if (bvh.nodes || bvh.primitive_indices) {
-        cuBQL::bvh3f native = cubql_native_view(bvh);
+        CuBQLNativeBVH native = cubql_native_view(bvh);
         try {
             cuBQL::cuda::free(native, 0, cubql_get_mem_resource());
         } catch (const std::exception& e) {
@@ -925,22 +930,9 @@ void cubql_bvh_destroy_device(CuBQLBVH& bvh)
 
 bool cubql_bvh_refit_device(CuBQLBVH& bvh)
 {
-    ContextGuard guard(bvh.context);
-    if (!bvh.nodes || !bvh.boxes || bvh.num_items <= 0) {
-        return true;
-    }
-
-    cubql_update_device_boxes(bvh);
-    cuBQL::bvh3f native = cubql_native_view(bvh);
-    try {
-        cuBQL::cuda::refit(native, reinterpret_cast<cuBQL::box3f*>(bvh.boxes), 0, cubql_get_mem_resource());
-        return true;
-    } catch (const std::exception& e) {
-        wp::set_error_string("Warp error: cuBQL BVH refit failed: %s", e.what());
-    } catch (...) {
-        wp::set_error_string("Warp error: cuBQL BVH refit failed: unknown exception");
-    }
-    return false;
+    // cuBQL only exposes refit for BinaryBVH; rebuild to keep the WideBVH descriptor valid.
+    cubql_bvh_rebuild_device(bvh);
+    return bvh.num_items <= 0 || (bvh.nodes && bvh.primitive_indices);
 }
 
 void cubql_bvh_rebuild_device(CuBQLBVH& bvh)
@@ -959,7 +951,7 @@ void cubql_bvh_rebuild_device(CuBQLBVH& bvh)
     };
 
     if (bvh.nodes || bvh.primitive_indices) {
-        cuBQL::bvh3f old_native = cubql_native_view(bvh);
+        CuBQLNativeBVH old_native = cubql_native_view(bvh);
         try {
             cuBQL::cuda::free(old_native, 0, cubql_get_mem_resource());
         } catch (const std::exception& e) {
@@ -980,7 +972,7 @@ void cubql_bvh_rebuild_device(CuBQLBVH& bvh)
     cubql_update_device_boxes(bvh);
 
     try {
-        cuBQL::bvh3f native;
+        CuBQLNativeBVH native;
         cuBQL::BuildConfig build_config;
         build_config.enableSAH();
         build_config.makeLeafThreshold = bvh.leaf_size;
@@ -1104,11 +1096,12 @@ void wp_cubql_bvh_refit_device(uint64_t id)
     wp::CuBQLBVH bvh;
     if (wp::cubql_bvh_get_descriptor(id, bvh)) {
         ContextGuard guard(bvh.context);
-        if (!wp::cubql_bvh_refit_device(bvh)) {
-            return;
-        }
+        const bool success = wp::cubql_bvh_refit_device(bvh);
         wp::cubql_bvh_add_descriptor(id, bvh);
         wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::CuBQLBVH));
+        if (!success) {
+            return;
+        }
     }
 }
 

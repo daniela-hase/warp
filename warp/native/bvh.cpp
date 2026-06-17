@@ -784,6 +784,12 @@ void cubql_bvh_rem_descriptor(uint64_t id) { g_cubql_bvh_descriptors.erase(id); 
 
 #ifndef WP_DISABLE_CUBQL
 
+using CuBQLNativeBVH = cuBQL::WideBVH<float, 3, CUBQL_WIDE_BVH_WIDTH>;
+using CuBQLBinaryBVH = cuBQL::bvh3f;
+
+static_assert(sizeof(CuBQLNode) == sizeof(CuBQLNativeBVH::node_t), "CuBQL wide node layout mismatch");
+static_assert(alignof(CuBQLNode) == alignof(CuBQLNativeBVH::node_t), "CuBQL wide node alignment mismatch");
+
 static inline cuBQL::box3f make_cubql_box(const vec3& lower, const vec3& upper)
 {
     return cuBQL::box3f(cuBQL::vec3f(lower[0], lower[1], lower[2]), cuBQL::vec3f(upper[0], upper[1], upper[2]));
@@ -797,17 +803,17 @@ static void cubql_update_host_boxes(CuBQLBVH& bvh)
     }
 }
 
-static cuBQL::bvh3f make_cubql_native_view(const CuBQLBVH& bvh)
+static CuBQLNativeBVH make_cubql_native_view(const CuBQLBVH& bvh)
 {
-    cuBQL::bvh3f native;
-    native.nodes = reinterpret_cast<cuBQL::bvh3f::node_t*>(bvh.nodes);
+    CuBQLNativeBVH native;
+    native.nodes = reinterpret_cast<CuBQLNativeBVH::node_t*>(bvh.nodes);
     native.numNodes = uint32_t(bvh.num_nodes);
     native.primIDs = reinterpret_cast<uint32_t*>(bvh.primitive_indices);
     native.numPrims = uint32_t(bvh.num_prims);
     return native;
 }
 
-static void cubql_assign_from_native(CuBQLBVH& bvh, const cuBQL::bvh3f& native)
+static void cubql_assign_from_native(CuBQLBVH& bvh, const CuBQLNativeBVH& native)
 {
     bvh.nodes = reinterpret_cast<CuBQLNode*>(native.nodes);
     bvh.num_nodes = int(native.numNodes);
@@ -816,6 +822,132 @@ static void cubql_assign_from_native(CuBQLBVH& bvh, const cuBQL::bvh3f& native)
     if (bvh.root) {
         bvh.root[0] = native.numNodes > 0 ? 0 : -1;
     }
+}
+
+// The vendored CPU WideBVH builder is a stub, so build a binary tree and collapse it like cuBQL's GPU wide builder.
+static CuBQLNativeBVH cubql_collapse_binary_to_wide(CuBQLBinaryBVH& binary)
+{
+    CuBQLNativeBVH wide;
+    if (binary.numNodes == 0) {
+        return wide;
+    }
+
+    std::vector<int> binary_to_wide(binary.numNodes, -1);
+    std::vector<int> wide_roots;
+    std::vector<int> node_stack;
+    std::vector<int> depth_stack;
+    node_stack.push_back(0);
+    depth_stack.push_back(0);
+
+    while (!node_stack.empty()) {
+        const int node_id = node_stack.back();
+        const int depth = depth_stack.back();
+        node_stack.pop_back();
+        depth_stack.pop_back();
+
+        const auto& node = binary.nodes[node_id];
+        const bool is_leaf = node.admin.count > 0;
+        const bool is_wide_root
+            = (!is_leaf && (depth % cuBQL::log_of<CUBQL_WIDE_BVH_WIDTH>::value) == 0) || binary.numNodes == 1;
+
+        if (is_wide_root) {
+            binary_to_wide[node_id] = int(wide_roots.size());
+            wide_roots.push_back(node_id);
+        }
+
+        if (!is_leaf) {
+            node_stack.push_back(int(node.admin.offset + 1));
+            depth_stack.push_back(depth + 1);
+            node_stack.push_back(int(node.admin.offset + 0));
+            depth_stack.push_back(depth + 1);
+        }
+    }
+
+    wide.nodes = new CuBQLNativeBVH::node_t[wide_roots.size()];
+    wide.numNodes = uint32_t(wide_roots.size());
+    wide.primIDs = binary.primIDs;
+    wide.numPrims = binary.numPrims;
+    binary.primIDs = nullptr;
+    binary.numPrims = 0;
+
+    for (int wide_id = 0; wide_id < int(wide_roots.size()); ++wide_id) {
+        auto& target = wide.nodes[wide_id];
+        int num_written = 0;
+
+        int collapse_stack[CUBQL_WIDE_BVH_WIDTH + 1];
+        int* stack_ptr = collapse_stack;
+        const int binary_root = wide_roots[wide_id];
+        *stack_ptr++ = binary_root;
+
+        while (stack_ptr > collapse_stack) {
+            const int node_id = *--stack_ptr;
+            const auto& node = binary.nodes[node_id];
+            const bool is_leaf = node.admin.count > 0;
+            const bool is_child_wide_root = node_id != binary_root && binary_to_wide[node_id] >= 0;
+
+            if (is_leaf || is_child_wide_root) {
+                assert(num_written < CUBQL_WIDE_BVH_WIDTH);
+                auto& child = target.children[num_written++];
+                child.bounds = node.bounds;
+                child.valid = 1;
+                child.offset = is_leaf ? node.admin.offset : uint64_t(binary_to_wide[node_id]);
+                child.count = is_leaf ? node.admin.count : 0;
+            } else {
+                *stack_ptr++ = int(node.admin.offset + 0);
+                *stack_ptr++ = int(node.admin.offset + 1);
+            }
+        }
+
+        while (num_written < CUBQL_WIDE_BVH_WIDTH) {
+            auto& child = target.children[num_written++];
+            child.bounds.set_empty();
+            child.valid = 0;
+            child.offset = (1ull << 45) - 1ull;
+            child.count = 0xffffu;
+        }
+    }
+
+    return wide;
+}
+
+static CuBQLNativeBVH cubql_build_wide_host(const cuBQL::box3f* boxes, int num_items, int leaf_size)
+{
+    CuBQLBinaryBVH binary;
+    cuBQL::BuildConfig build_config;
+    build_config.enableSAH();
+    build_config.makeLeafThreshold = leaf_size;
+    cuBQL::cpuBuilder(binary, boxes, uint32_t(num_items), build_config);
+
+    CuBQLNativeBVH wide = cubql_collapse_binary_to_wide(binary);
+    cuBQL::cpu::freeBVH(binary);
+    return wide;
+}
+
+static cuBQL::box3f cubql_refit_wide_node(CuBQLNativeBVH& bvh, const cuBQL::box3f* boxes, uint32_t node_index)
+{
+    cuBQL::box3f node_box;
+    auto& node = bvh.nodes[node_index];
+
+    for (int i = 0; i < CUBQL_WIDE_BVH_WIDTH; ++i) {
+        auto& child = node.children[i];
+        if (!child.valid) {
+            continue;
+        }
+
+        cuBQL::box3f child_box;
+        if (child.count != 0) {
+            for (int prim = 0; prim < int(child.count); ++prim) {
+                child_box.extend(boxes[bvh.primIDs[child.offset + prim]]);
+            }
+        } else {
+            child_box = cubql_refit_wide_node(bvh, boxes, uint32_t(child.offset));
+        }
+
+        child.bounds = child_box;
+        node_box.extend(child_box);
+    }
+
+    return node_box;
 }
 
 #endif  // !WP_DISABLE_CUBQL
@@ -880,18 +1012,14 @@ void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_s
     bvh.boxes = reinterpret_cast<void*>(new cuBQL::box3f[num_items]);
     cubql_update_host_boxes(bvh);
 
-    cuBQL::bvh3f native;
-    cuBQL::BuildConfig build_config;
-    build_config.enableSAH();
-    build_config.makeLeafThreshold = leaf_size;
-    cuBQL::cpuBuilder(native, reinterpret_cast<cuBQL::box3f*>(bvh.boxes), uint32_t(num_items), build_config);
+    CuBQLNativeBVH native = cubql_build_wide_host(reinterpret_cast<cuBQL::box3f*>(bvh.boxes), num_items, leaf_size);
     cubql_assign_from_native(bvh, native);
 }
 
 void cubql_bvh_destroy_host(CuBQLBVH& bvh)
 {
     if (bvh.nodes || bvh.primitive_indices) {
-        cuBQL::bvh3f native = make_cubql_native_view(bvh);
+        CuBQLNativeBVH native = make_cubql_native_view(bvh);
         cuBQL::cpu::freeBVH(native);
     }
 
@@ -913,14 +1041,17 @@ void cubql_bvh_refit_host(CuBQLBVH& bvh)
         return;
 
     cubql_update_host_boxes(bvh);
-    cuBQL::bvh3f native = make_cubql_native_view(bvh);
-    cuBQL::cpu::spatialMedian_impl::refit(0, native, reinterpret_cast<cuBQL::box3f*>(bvh.boxes));
+    CuBQLNativeBVH native = make_cubql_native_view(bvh);
+    const int root_index = bvh.root ? bvh.root[0] : -1;
+    if (root_index >= 0) {
+        cubql_refit_wide_node(native, reinterpret_cast<cuBQL::box3f*>(bvh.boxes), uint32_t(root_index));
+    }
 }
 
 void cubql_bvh_rebuild_host(CuBQLBVH& bvh)
 {
     if (bvh.nodes || bvh.primitive_indices) {
-        cuBQL::bvh3f old_native = make_cubql_native_view(bvh);
+        CuBQLNativeBVH old_native = make_cubql_native_view(bvh);
         cuBQL::cpu::freeBVH(old_native);
     }
 
@@ -940,11 +1071,8 @@ void cubql_bvh_rebuild_host(CuBQLBVH& bvh)
     }
     cubql_update_host_boxes(bvh);
 
-    cuBQL::bvh3f native;
-    cuBQL::BuildConfig build_config;
-    build_config.enableSAH();
-    build_config.makeLeafThreshold = bvh.leaf_size;
-    cuBQL::cpuBuilder(native, reinterpret_cast<cuBQL::box3f*>(bvh.boxes), uint32_t(bvh.num_items), build_config);
+    CuBQLNativeBVH native
+        = cubql_build_wide_host(reinterpret_cast<cuBQL::box3f*>(bvh.boxes), bvh.num_items, bvh.leaf_size);
     cubql_assign_from_native(bvh, native);
 }
 

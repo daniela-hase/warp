@@ -17,6 +17,7 @@
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
 #define CUBQL_BVH_QUERY_STACK_SIZE (64)
+#define CUBQL_WIDE_BVH_WIDTH (4)
 #define CUBQL_MESH_CONSTRUCTOR_TYPE (-1)
 
 #define BVH_CONSTRUCTOR_SAH (0)
@@ -205,15 +206,19 @@ struct BVH {
     void* context;
 };
 
-// Node layout compatible with cuBQL::BinaryBVH<float, 3>::Node.
-// lower/upper store bounds, admin packs:
-//  - lower 48 bits: offset (children for inner nodes, prim range start for leaves).
-//    Inner-node children are stored as a pair at offset+0 and offset+1.
-//  - upper 16 bits: count (0 for inner, >0 for leaves)
-struct CuBQLNode {
+// Child/node layout compatible with cuBQL::WideBVH<float, 3, CUBQL_WIDE_BVH_WIDTH>::Node.
+// Leaf children store a primitive range in primitive_indices[offset:offset+count].
+// Inner children store the child wide-node index in offset and have count == 0.
+struct alignas(16) CuBQLWideChild {
     vec3 lower;
     vec3 upper;
-    uint64_t admin;
+    uint64_t valid : 1;
+    uint64_t offset : 45;
+    uint64_t count : 16;
+};
+
+struct alignas(16) CuBQLNode {
+    CuBQLWideChild children[CUBQL_WIDE_BVH_WIDTH];
 };
 
 struct CuBQLBVH {
