@@ -1761,7 +1761,7 @@ CUDA_CALLABLE inline bool mesh_query_ray_intersect_aabb(
         return intersect_ray_aabb_robust(start, dir, rcp_dir, lower, upper, t);
 }
 
-CUDA_CALLABLE inline bool mesh_query_ray(
+CUDA_CALLABLE inline bool mesh_query_ray_combined(
     uint64_t id,
     const vec3& start,
     const vec3& dir,
@@ -1772,7 +1772,8 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     float& sign,
     vec3& normal,
     int& face,
-    int root = -1
+    int root = -1,
+    bool first_hit = false
 )
 {
     Mesh mesh = mesh_get(id);
@@ -1813,6 +1814,9 @@ CUDA_CALLABLE inline bool mesh_query_ray(
 
                 if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
                     if (tri_t < min_t && tri_t >= 0.0f) {
+                        if (first_hit)
+                            return true;
+
                         min_t = tri_t;
                         min_face = primitive_index;
                         min_u = tri_u;
@@ -1886,87 +1890,32 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     }
 }
 
+CUDA_CALLABLE inline bool mesh_query_ray(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face,
+    int root = -1,
+    bool first_hit = false
+)
+{
+    return mesh_query_ray_combined(id, start, dir, max_t, t, u, v, sign, normal, face, root, false);
+}
+
 CUDA_CALLABLE inline bool
 mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root = -1)
 {
-    Mesh mesh = mesh_get(id);
+    float t, u, v, sign;
+    vec3 normal;
+    int face;
 
-    uint64_t stack[BVH_QUERY_STACK_SIZE];
-    int stack_size = 0;
-    uint64_t cur_node = bvh_query_node_load(mesh.bvh, (root == -1) ? *mesh.bvh.root : root);
-
-    vec3 ray_dir = mesh_query_ray_safe_dir(dir);
-    vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
-    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
-
-    while (true) {
-        if (bvh_query_node_is_leaf(cur_node)) {
-            const int primitive_begin = bvh_query_node_lower_payload(cur_node);
-            const int primitive_end = bvh_query_node_upper_payload(cur_node);
-            for (int pc = primitive_begin; pc < primitive_end; ++pc) {
-                int primitive_index = mesh.bvh.primitive_indices[pc];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
-
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
-
-                float tri_t, tri_u, tri_v, tri_sign;
-                vec3 n;
-
-                if (intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n)) {
-                    if (tri_t < max_t && tri_t >= 0.0f) {
-                        return true;
-                    }
-                }
-            }
-            if (stack_size == 0)
-                return false;
-            cur_node = stack[--stack_size];
-            continue;
-        }
-
-        const int left_index = bvh_query_node_lower_payload(cur_node);
-        const int right_index = bvh_query_node_upper_payload(cur_node);
-
-        BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-        BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
-        BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-        BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
-
-        float t0 = FLT_MAX;
-        float t1 = FLT_MAX;
-        const bool h0 = mesh_query_ray_intersect_aabb(
-                            start, dir, rcp_dir, fast_aabb, vec3(left_lower.x, left_lower.y, left_lower.z),
-                            vec3(left_upper.x, left_upper.y, left_upper.z), t0
-                        )
-            && t0 < max_t;
-        const bool h1 = mesh_query_ray_intersect_aabb(
-                            start, dir, rcp_dir, fast_aabb, vec3(right_lower.x, right_lower.y, right_lower.z),
-                            vec3(right_upper.x, right_upper.y, right_upper.z), t1
-                        )
-            && t1 < max_t;
-
-        if (h0 && h1) {
-            const bool near_left = (t0 < t1);
-            if (stack_size >= BVH_QUERY_STACK_SIZE)
-                return false;
-            const uint64_t left_node = bvh_query_node_pack(left_lower, left_upper);
-            const uint64_t right_node = bvh_query_node_pack(right_lower, right_upper);
-            stack[stack_size++] = near_left ? right_node : left_node;
-            cur_node = near_left ? left_node : right_node;
-        } else if (h0) {
-            cur_node = bvh_query_node_pack(left_lower, left_upper);
-        } else if (h1) {
-            cur_node = bvh_query_node_pack(right_lower, right_upper);
-        } else {
-            if (stack_size == 0)
-                return false;
-            cur_node = stack[--stack_size];
-        }
-    }
+    return mesh_query_ray_combined(id, start, dir, max_t, t, u, v, sign, normal, face, root, true);
 }
 
 CUDA_CALLABLE inline int mesh_query_ray_count_intersections(uint64_t id, const vec3& start, const vec3& dir, int root)
