@@ -27,6 +27,25 @@ def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_inters
         bounds_intersected[bounds_nr] = 1
 
 
+@wp.kernel
+def bvh_query_ray_count_hits(
+    bvh_id: wp.uint64,
+    ray_starts: wp.array[wp.vec3],
+    ray_dirs: wp.array[wp.vec3],
+    hit_counts: wp.array[int],
+):
+    tid = wp.tid()
+    query = wp.bvh_query_ray(bvh_id, ray_starts[tid], ray_dirs[tid])
+    bounds_nr = int(0)
+    count = int(0)
+    max_dist = float(10.0)
+
+    while wp.bvh_query_next(query, bounds_nr, max_dist):
+        count += 1
+
+    hit_counts[tid] = count
+
+
 def aabb_overlap(a_lower, a_upper, b_lower, b_upper):
     if (
         a_lower[0] > b_upper[0]
@@ -165,6 +184,98 @@ def test_bvh_ray_query_inside_and_outside_bounds(test, device):
         device_intersected = bounds_intersected.numpy()
         # Both cases should detect the single intersection
         test.assertEqual(device_intersected.sum(), 1)
+
+
+def test_bvh_query_ray_parallel_slab_boundaries(test, device):
+    """BVH ray queries should handle axis-aligned rays on AABB slab faces."""
+    lowers = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [4.0, 4.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    uppers = np.array(
+        [
+            [2.0, 2.0, 2.0],
+            [6.0, 6.0, 2.0],
+        ],
+        dtype=np.float32,
+    )
+
+    ray_starts = np.array(
+        [
+            [2.0, 1.0, 3.0],
+            [0.0, 1.0, 3.0],
+            [1.0, 2.0, 3.0],
+            [1.0, 0.0, 3.0],
+            [1.0, 1.0, 3.0],
+        ],
+        dtype=np.float32,
+    )
+    ray_dirs = np.tile([0.0, 0.0, -1.0], (len(ray_starts), 1)).astype(np.float32)
+    labels = [
+        "start.x == upper.x",
+        "start.x == lower.x",
+        "start.y == upper.y",
+        "start.y == lower.y",
+        "interior",
+    ]
+
+    constructors = ["sah", "median"]
+    if device.is_cuda:
+        constructors.append("lbvh")
+
+    for constructor in constructors:
+        for leaf_size in (1, 2):
+            device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+            device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+            bvh = wp.Bvh(device_lowers, device_uppers, constructor=constructor, leaf_size=leaf_size)
+
+            starts_wp = wp.array(ray_starts, dtype=wp.vec3, device=device)
+            dirs_wp = wp.array(ray_dirs, dtype=wp.vec3, device=device)
+            hit_counts = wp.zeros(len(ray_starts), dtype=int, device=device)
+            wp.launch(
+                bvh_query_ray_count_hits,
+                dim=len(ray_starts),
+                inputs=[bvh.id, starts_wp, dirs_wp, hit_counts],
+                device=device,
+            )
+
+            counts_np = hit_counts.numpy()
+            for i, label in enumerate(labels):
+                test.assertEqual(
+                    counts_np[i],
+                    1,
+                    f"[{constructor}, leaf_size={leaf_size}] {label}: expected one hit, got {counts_np[i]}",
+                )
+
+            if device.is_cuda:
+                for i, label in enumerate(labels):
+                    bounds_intersected = wp.zeros(shape=len(lowers), dtype=int, device=device)
+                    wp.launch_tiled(
+                        kernel=tile_bvh_query_ray_kernel,
+                        dim=1,
+                        inputs=[
+                            bvh.id,
+                            wp.vec3(float(ray_starts[i][0]), float(ray_starts[i][1]), float(ray_starts[i][2])),
+                            wp.vec3(float(ray_dirs[i][0]), float(ray_dirs[i][1]), float(ray_dirs[i][2])),
+                            bounds_intersected,
+                        ],
+                        device=device,
+                        block_dim=64,
+                    )
+                    tile_result = bounds_intersected.numpy()
+                    test.assertEqual(
+                        tile_result[0],
+                        1,
+                        f"[tiled, {constructor}, leaf_size={leaf_size}] {label}: expected first bound to hit",
+                    )
+                    test.assertEqual(
+                        tile_result[1],
+                        0,
+                        f"[tiled, {constructor}, leaf_size={leaf_size}] {label}: expected second bound to miss",
+                    )
 
 
 def test_bvh_refit_root_leaves(test, device):
@@ -842,6 +953,12 @@ add_function_test(
     TestBvh,
     "test_bvh_ray_query_inside_and_outside_bounds",
     test_bvh_ray_query_inside_and_outside_bounds,
+    devices=devices,
+)
+add_function_test(
+    TestBvh,
+    "test_bvh_query_ray_parallel_slab_boundaries",
+    test_bvh_query_ray_parallel_slab_boundaries,
     devices=devices,
 )
 add_function_test(TestBvh, "test_bvh_refit_root_leaves", test_bvh_refit_root_leaves, devices=cuda_devices)

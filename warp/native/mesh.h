@@ -1728,18 +1728,6 @@ CUDA_CALLABLE inline void adj_mesh_query_point_sign_winding_number(
     );
 }
 
-CUDA_CALLABLE inline vec3 mesh_query_ray_safe_dir(const vec3& dir)
-{
-    vec3 ray_dir = dir;
-    if (ray_dir[0] == 0.0f)
-        ray_dir[0] = 1.0e-20f;
-    if (ray_dir[1] == 0.0f)
-        ray_dir[1] = 1.0e-20f;
-    if (ray_dir[2] == 0.0f)
-        ray_dir[2] = 1.0e-20f;
-    return ray_dir;
-}
-
 CUDA_CALLABLE inline bool mesh_query_ray_use_fast_aabb(const vec3& dir)
 {
     return dir[0] != 0.0f && dir[1] != 0.0f && dir[2] != 0.0f;
@@ -1781,8 +1769,7 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     int stack_size = 0;
     uint64_t cur_node = bvh_query_node_load(mesh.bvh, (root == -1) ? *mesh.bvh.root : root);
 
-    vec3 ray_dir = mesh_query_ray_safe_dir(dir);
-    vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    vec3 rcp_dir = 1.0f / dir;
     const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
 
     float min_t = max_t;
@@ -1895,8 +1882,7 @@ mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max
     int stack_size = 0;
     uint64_t cur_node = bvh_query_node_load(mesh.bvh, (root == -1) ? *mesh.bvh.root : root);
 
-    vec3 ray_dir = mesh_query_ray_safe_dir(dir);
-    vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    vec3 rcp_dir = 1.0f / dir;
     const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
 
     while (true) {
@@ -1978,7 +1964,7 @@ CUDA_CALLABLE inline int mesh_query_ray_count_intersections(uint64_t id, const v
     stack[0] = root == -1 ? *mesh.bvh.root : root;
     int count = 1;
 
-    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 rcp_dir = 1.0f / dir;
 
     int num_hit = 0;
     float temp_t;
@@ -2058,7 +2044,7 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
 
     int count = 1;
 
-    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 rcp_dir = 1.0f / dir;
 
     float min_t = max_t;
     int min_face;
@@ -2286,7 +2272,7 @@ mesh_query_ray_closest_sign(const Mesh& mesh, const vec3& start, const vec3& dir
     int stack_size = 0;
     int node_index = *mesh.bvh.root;
 
-    vec3 rcp_dir(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
+    vec3 rcp_dir = 1.0f / dir;
     float min_t = FLT_MAX;
     float temp_t;
     bool hit = false;

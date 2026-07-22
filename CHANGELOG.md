@@ -50,6 +50,9 @@
   Language Reference and API Reference closer to the User Guide, and consolidate memory-management guidance.
 - Speed up redeclaring kernels created by factory functions
   ([GH-1486](https://github.com/NVIDIA/warp/issues/1486)).
+- Improve `wp.bvh_query_ray()` traversal performance for shrinking `max_dist` queries by visiting the nearer child
+  first, reusing loaded child bounds during descent, and using robust ray-AABB slab handling for axis-aligned scalar and
+  tiled BVH ray queries.
 
 ### Fixed
 

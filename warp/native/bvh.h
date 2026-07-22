@@ -345,6 +345,27 @@ CUDA_CALLABLE inline int bvh_query_node_lower_payload(uint64_t node) { return in
 
 CUDA_CALLABLE inline int bvh_query_node_upper_payload(uint64_t node) { return int((node >> 31) & 0x7fffffffu); }
 
+CUDA_CALLABLE inline bool bvh_query_ray_use_fast_aabb(const vec3& dir)
+{
+    return dir[0] != 0.0f && dir[1] != 0.0f && dir[2] != 0.0f;
+}
+
+CUDA_CALLABLE inline bool bvh_query_ray_intersect_aabb(
+    const vec3& start,
+    const vec3& dir,
+    const vec3& rcp_dir,
+    bool fast_aabb,
+    const vec3& lower,
+    const vec3& upper,
+    float& t
+)
+{
+    if (fast_aabb)
+        return intersect_ray_aabb(start, rcp_dir, lower, upper, t);
+    else
+        return intersect_ray_aabb_robust(start, dir, rcp_dir, lower, upper, t);
+}
+
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
 {
     int da = 0, db = 0;
@@ -405,11 +426,13 @@ struct bvh_query_t {
         : bvh()
         , stack()
         , count(0)
-        , is_ray(false)
+        , primitive_counter(-1)
         , input_lower()
         , input_upper()
+        , input_ray_dir()
         , bounds_nr(0)
-        , primitive_counter(-1)
+        , is_ray(false)
+        , ray_fast_aabb(true)
         , last_query_valid(true)
     {
     }
@@ -432,11 +455,13 @@ struct bvh_query_t {
     int primitive_counter;
 
     // inputs
-    wp::vec3 input_lower;  // start for ray
-    wp::vec3 input_upper;  // dir for ray
+    wp::vec3 input_lower;  // lower bound for AABB queries, start for ray queries
+    wp::vec3 input_upper;  // upper bound for AABB queries, reciprocal direction for ray queries
+    wp::vec3 input_ray_dir;  // original direction for ray queries
 
     int bounds_nr;
     bool is_ray;
+    bool ray_fast_aabb;
     // Tracks whether the most recent bvh_query_next() / tile_bvh_query_next() call
     // produced a valid index. Seeded to true on construction so an initial
     // tile_query_valid() check (before any next() call) reports valid.
@@ -447,7 +472,9 @@ CUDA_CALLABLE inline bool
 bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, const vec3& node_upper, float& t)
 {
     if (query.is_ray) {
-        return intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        return bvh_query_ray_intersect_aabb(
+            query.input_lower, query.input_ray_dir, query.input_upper, query.ray_fast_aabb, node_lower, node_upper, t
+        );
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
@@ -481,6 +508,8 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3&
     query.primitive_counter = 0;
     query.input_lower = lower;
     query.input_upper = upper;
+    query.input_ray_dir = upper;
+    query.ray_fast_aabb = true;
 
     return query;
 }
@@ -492,7 +521,13 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
 
 CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
 {
-    return bvh_query(id, true, start, 1.0f / dir, root);
+    vec3 rcp_dir = 1.0f / dir;
+
+    bvh_query_t query = bvh_query(id, true, start, rcp_dir, root);
+    query.input_ray_dir = dir;
+    query.ray_fast_aabb = bvh_query_ray_use_fast_aabb(dir);
+
+    return query;
 }
 
 CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
@@ -501,62 +536,117 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
 
     // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
-        const int node_index = query.stack[--query.count];
+        int node_index = query.stack[--query.count];
 
         BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+        bool node_hit_known = query.primitive_counter != 0;
 
-        if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
-            bool hit = bvh_query_intersection_test(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
-            );
-            if (!hit || (query.is_ray && t >= max_dist)) {
-                continue;
-            }
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-
-            // Fast path when the actual leaf range contains exactly one primitive
-            if (end - start == 1) {
-                int primitive_index = bvh.primitive_indices[start];
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            } else {
-                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
-
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
-                    query.stack[query.count++] = node_index;
-                }
+        while (true) {
+            if (!node_hit_known) {
                 float t = FLT_MAX;
                 bool hit = bvh_query_intersection_test(
-                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
+                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
                 );
                 if (!hit || (query.is_ray && t >= max_dist)) {
-                    continue;
+                    break;
                 }
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
             }
-        } else {
+
+            node_hit_known = false;
+
+            const int left_index = node_lower.i;
+            const int right_index = node_upper.i;
+
+            if (node_lower.b) {
+                const int start = left_index;
+                const int end = right_index;
+
+                // Fast path when the actual leaf range contains exactly one primitive
+                if (end - start == 1) {
+                    int primitive_index = bvh.primitive_indices[start];
+                    index = primitive_index;
+                    query.bounds_nr = primitive_index;
+                    return true;
+                } else {
+                    int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
+
+                    // if already visited the last primitive in the leaf node
+                    // move to the next node and reset the primitive counter to 0
+                    if (start + query.primitive_counter == end) {
+                        query.primitive_counter = 0;
+                    }
+                    // otherwise we need to keep this leaf node in stack for a future visit
+                    else {
+                        if (query.count >= BVH_QUERY_STACK_SIZE)
+                            return false;
+                        query.stack[query.count++] = node_index;
+                    }
+                    float t = FLT_MAX;
+                    bool hit = bvh_query_intersection_test(
+                        query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
+                    );
+                    if (!hit || (query.is_ray && t >= max_dist)) {
+                        break;
+                    }
+                    index = primitive_index;
+                    query.bounds_nr = primitive_index;
+                    return true;
+                }
+            }
+
             // if it's not a leaf node we treat it as if we have visited the last primitive
             query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+
+            if (query.is_ray && max_dist < FLT_MAX) {
+                BVHPackedNodeHalf left_lower = bvh_load_node(bvh.node_lowers, left_index);
+                BVHPackedNodeHalf left_upper = bvh_load_node(bvh.node_uppers, left_index);
+                BVHPackedNodeHalf right_lower = bvh_load_node(bvh.node_lowers, right_index);
+                BVHPackedNodeHalf right_upper = bvh_load_node(bvh.node_uppers, right_index);
+
+                float t0 = FLT_MAX;
+                float t1 = FLT_MAX;
+                const bool h0 = bvh_query_ray_intersect_aabb(
+                                    query.input_lower, query.input_ray_dir, query.input_upper, query.ray_fast_aabb,
+                                    reinterpret_cast<vec3&>(left_lower), reinterpret_cast<vec3&>(left_upper), t0
+                                )
+                    && t0 < max_dist;
+                const bool h1 = bvh_query_ray_intersect_aabb(
+                                    query.input_lower, query.input_ray_dir, query.input_upper, query.ray_fast_aabb,
+                                    reinterpret_cast<vec3&>(right_lower), reinterpret_cast<vec3&>(right_upper), t1
+                                )
+                    && t1 < max_dist;
+
+                if (h0 && h1) {
+                    const bool near_left = (t0 < t1);
+                    if (query.count >= BVH_QUERY_STACK_SIZE)
+                        return false;
+
+                    query.stack[query.count++] = near_left ? right_index : left_index;
+                    node_index = near_left ? left_index : right_index;
+                    node_lower = near_left ? left_lower : right_lower;
+                    node_upper = near_left ? left_upper : right_upper;
+                    node_hit_known = true;
+                } else if (h0) {
+                    node_index = left_index;
+                    node_lower = left_lower;
+                    node_upper = left_upper;
+                    node_hit_known = true;
+                } else if (h1) {
+                    node_index = right_index;
+                    node_lower = right_lower;
+                    node_upper = right_upper;
+                    node_hit_known = true;
+                } else {
+                    break;
+                }
+            } else {
+                if (query.count + 2 > BVH_QUERY_STACK_SIZE)
+                    return false;
+                query.stack[query.count++] = left_index;
+                query.stack[query.count++] = right_index;
+                break;
+            }
         }
     }
     return false;
