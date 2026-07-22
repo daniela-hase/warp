@@ -4,24 +4,22 @@
 .. currentmodule:: warp.sparse
 
 .. autoclass:: BsrMatrix
-
    
-   .. automethod:: __init__
-
    
    .. rubric:: Methods
 
    .. autosummary::
    
-      ~BsrMatrix.__init__
+      ~BsrMatrix.clear_status
       ~BsrMatrix.copy_nnz_async
       ~BsrMatrix.nnz_sync
       ~BsrMatrix.notify_nnz_changed
+      ~BsrMatrix.status_message
+      ~BsrMatrix.status_sync
       ~BsrMatrix.transpose
       ~BsrMatrix.uncompress_rows
    
    
-
    
    
    .. rubric:: Attributes
