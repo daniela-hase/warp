@@ -430,6 +430,9 @@ struct bvh_query_t {
         , input_lower()
         , input_upper()
         , input_ray_dir()
+        , ray_initial_max_dist(FLT_MAX)
+        , ray_initial_max_dist_set(false)
+        , ray_ordered_traversal(false)
         , bounds_nr(0)
         , is_ray(false)
         , ray_fast_aabb(true)
@@ -458,6 +461,9 @@ struct bvh_query_t {
     wp::vec3 input_lower;  // lower bound for AABB queries, start for ray queries
     wp::vec3 input_upper;  // upper bound for AABB queries, reciprocal direction for ray queries
     wp::vec3 input_ray_dir;  // original direction for ray queries
+    float ray_initial_max_dist;
+    bool ray_initial_max_dist_set;
+    bool ray_ordered_traversal;
 
     int bounds_nr;
     bool is_ray;
@@ -534,6 +540,11 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
 {
     BVH bvh = query.bvh;
 
+    if (query.is_ray && !query.ray_initial_max_dist_set) {
+        query.ray_initial_max_dist = max_dist;
+        query.ray_initial_max_dist_set = true;
+    }
+
     // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
         int node_index = query.stack[--query.count];
@@ -598,7 +609,10 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             // if it's not a leaf node we treat it as if we have visited the last primitive
             query.primitive_counter = 0;
 
-            if (query.is_ray && max_dist < FLT_MAX) {
+            const bool use_ordered_ray_traversal = query.is_ray
+                && (query.ray_ordered_traversal ? max_dist < FLT_MAX : max_dist < query.ray_initial_max_dist);
+
+            if (use_ordered_ray_traversal) {
                 BVHPackedNodeHalf left_lower = bvh_load_node(bvh.node_lowers, left_index);
                 BVHPackedNodeHalf left_upper = bvh_load_node(bvh.node_uppers, left_index);
                 BVHPackedNodeHalf right_lower = bvh_load_node(bvh.node_lowers, right_index);
